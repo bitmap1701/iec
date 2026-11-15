@@ -20,7 +20,24 @@ namespace iec
         public TcpClient Client { get; set; }
         public StreamWriter Writer { get; set; }
         public CancellationTokenSource Cts { get; set; }
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
         public bool IsConnected => Client != null && Client.Connected;
+
+        public async Task SafeSendAsync(string payload)
+        {
+            await _writeLock.WaitAsync();
+            try
+            {
+                if (IsConnected && Writer != null)
+                {
+                    await Writer.WriteLineAsync(payload);
+                }
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
     }
 
     public class WebDashboardHost
@@ -30,7 +47,6 @@ namespace iec
         private readonly int _httpPort;
         private HttpListener _httpListener;
 
-        // Danh sÃ¡ch cÃ¡c TcpClient tháº­t Ä‘Æ°á»£c Ä‘iá»u khiá»ƒn tá»« khung Simulator bÃªn pháº£i giao diá»‡n Web
         private readonly ConcurrentDictionary<string, ManagedSimClient> _simClients = new();
 
         public WebDashboardHost(RedisPresenceService redisService, HrmTcpServer tcpServer, int httpPort = HrmProtocol.WebUiPort)
@@ -40,36 +56,51 @@ namespace iec
             _httpPort = httpPort;
         }
 
-        public async Task StartAsync(CancellationToken token)
+        public Task StartAsync(CancellationToken token)
         {
-            _httpListener = new HttpListener();
-            _httpListener.Prefixes.Add($"http://localhost:{_httpPort}/");
-            _httpListener.Start();
+            try
+            {
+                _httpListener = new HttpListener();
+                _httpListener.Prefixes.Add($"http://localhost:{_httpPort}/");
+                _httpListener.Start();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[CẢNH BÁO WEB UI] Không thể mở cổng HTTP {_httpPort}: {ex.Message}");
+                Console.ResetColor();
+                return Task.CompletedTask;
+            }
 
-            // Khá»Ÿi táº¡o sáºµn 3 káº¿t ná»‘i TCP Client máº«u tháº­t Ä‘á»ƒ báº£ng Dashboard cÃ³ dá»¯ liá»‡u ngay khi má»Ÿ lÃªn
+            // Khởi tạo sẵn 3 kết nối TCP Client mẫu thật để bảng Dashboard có dữ liệu ngay khi mở lên
             _ = Task.Run(async () =>
             {
                 await Task.Delay(400, token);
-                await ConnectRealTcpClientAsync("NV01", "Huá»³nh Nháº­t HoÃ ", "Core .NET");
-                await ConnectRealTcpClientAsync("NV02", "Tráº§n Minh Tuáº¥n", "Network Ops");
-                await ConnectRealTcpClientAsync("NV03", "LÃª HoÃ ng Nam", "QA Mac Lab");
+                await ConnectRealTcpClientAsync("NV01", "Huỳnh Nhật Hoà", "Core .NET");
+                await ConnectRealTcpClientAsync("NV02", "Lương Nhật Khôi", "macOS QA");
+                await ConnectRealTcpClientAsync("NV03", "Trần Minh Tuấn", "Network Ops");
                 await SendStatusRealTcpAsync("NV03", "Busy");
             }, token);
 
             OpenBrowser($"http://localhost:{_httpPort}");
-
             _ = Task.Run(() => HandleHttpRequestsLoopAsync(token), token);
+            return Task.CompletedTask;
         }
 
         public async Task ConnectRealTcpClientAsync(string empId, string fullName, string dept)
         {
-            empId = empId.Trim().ToUpperInvariant();
+            empId = HrmProtocol.Sanitize(empId, "NV01").ToUpperInvariant();
+            fullName = HrmProtocol.Sanitize(fullName, "Nhân viên");
+            dept = HrmProtocol.Sanitize(dept, "IT");
+
             await KillSocketWithoutLogoutAsync(empId);
 
             var tcp = new TcpClient();
             await tcp.ConnectAsync("127.0.0.1", HrmProtocol.DefaultPort);
             var stream = tcp.GetStream();
-            var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+            var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            var reader = new StreamReader(stream, utf8NoBom);
+            var writer = new StreamWriter(stream, utf8NoBom) { AutoFlush = true };
             var cts = new CancellationTokenSource();
 
             var sim = new ManagedSimClient
@@ -83,9 +114,28 @@ namespace iec
             };
             _simClients[empId] = sim;
 
-            await writer.WriteLineAsync($"{HrmProtocol.CmdLogin}|{empId}|{fullName}|{dept}");
+            await sim.SafeSendAsync($"{HrmProtocol.CmdLogin}|{empId}|{fullName}|{dept}");
 
-            // VÃ²ng láº·p báº¯n gÃ³i tin PING tháº­t má»—i 5 giÃ¢y qua TCP Socket
+            // Luồng đọc phản hồi PONG & BROADCAST từ NetworkStream để giải phóng bộ đệm nhận TCP
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    string line;
+                    while (!cts.Token.IsCancellationRequested && (line = await reader.ReadLineAsync()) != null)
+                    {
+                        line = line.Trim('\uFEFF', '\r', '\n');
+                        if (line.StartsWith("BROADCAST|"))
+                        {
+                            string msg = line.Substring("BROADCAST|".Length);
+                            _redisService.RecordBroadcastForStaff(empId, msg);
+                        }
+                    }
+                }
+                catch { }
+            }, cts.Token);
+
+            // Vòng lặp bắn gói tin PING thật mỗi 5 giây qua TCP Socket
             _ = Task.Run(async () =>
             {
                 try
@@ -93,10 +143,7 @@ namespace iec
                     using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(HrmProtocol.HeartbeatIntervalMs));
                     while (await timer.WaitForNextTickAsync(cts.Token))
                     {
-                        if (tcp.Connected)
-                        {
-                            await writer.WriteLineAsync($"{HrmProtocol.CmdPing}|{empId}");
-                        }
+                        await sim.SafeSendAsync($"{HrmProtocol.CmdPing}|{empId}");
                     }
                 }
                 catch { }
@@ -107,7 +154,7 @@ namespace iec
         {
             if (_simClients.TryGetValue(empId, out var sim) && sim.IsConnected)
             {
-                await sim.Writer.WriteLineAsync($"{HrmProtocol.CmdStatus}|{empId}|{status}");
+                await sim.SafeSendAsync($"{HrmProtocol.CmdStatus}|{empId}|{status}");
             }
         }
 
@@ -119,7 +166,8 @@ namespace iec
                 {
                     if (sim.IsConnected)
                     {
-                        await sim.Writer.WriteLineAsync($"{HrmProtocol.CmdLogout}|{empId}");
+                        await sim.SafeSendAsync($"{HrmProtocol.CmdLogout}|{empId}");
+                        await Task.Delay(150);
                     }
                     sim.Cts.Cancel();
                     sim.Client.Close();
@@ -139,7 +187,7 @@ namespace iec
                 try
                 {
                     sim.Cts.Cancel();
-                    sim.Client.Close(); // ÄÃ³ng ngang TCP Socket khÃ´ng gá»­i LOGOUT Ä‘á»ƒ test Redis TTL 15s
+                    sim.Client.Close(); // Đóng ngang TCP Socket không gửi LOGOUT để test Redis TTL 15s
                 }
                 catch { }
             }
@@ -148,7 +196,7 @@ namespace iec
 
         private async Task HandleHttpRequestsLoopAsync(CancellationToken token)
         {
-            while (!token.IsCancellationRequested && _httpListener.IsListening)
+            while (!token.IsCancellationRequested && _httpListener != null && _httpListener.IsListening)
             {
                 try
                 {
@@ -204,7 +252,7 @@ namespace iec
                     {
                         string id = root.GetProperty("empId").GetString();
                         await KillSocketWithoutLogoutAsync(id);
-                        _tcpServer.AddCustomLog("DROP", $"[KILL SOCKET] ÄÃ£ ngáº¯t ngang TcpClient cá»§a {id}. Äang Ä‘áº¿m ngÆ°á»£c Redis TTL 15s...");
+                        _tcpServer.AddCustomLog("DROP", $"[KILL SOCKET] Đã ngắt ngang TcpClient của {id}. Đang đếm ngược Redis TTL 15s...");
                     }
                     else if (action == "logout")
                     {
@@ -260,7 +308,7 @@ namespace iec
 <html lang='vi' class='dark'>
 <head>
   <meta charset='UTF-8'>
-  <title>PulseHRM Mini â€” C# .NET 9 TCP Socket & Redis Cockpit</title>
+  <title>IEC — C# .NET 9 TCP Socket & Redis Cockpit</title>
   <script src='https://cdn.tailwindcss.com'></script>
   <link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap' rel='stylesheet'>
   <style>
@@ -274,11 +322,11 @@ namespace iec
       <span class='w-3 h-3 rounded-full bg-emerald-400 animate-ping'></span>
       <div>
         <div class='flex items-center gap-2'>
-          <h1 class='font-bold text-base text-white'>PulseHRM Mini</h1>
+          <h1 class='font-bold text-base text-white'>IEC Presence Monitor</h1>
           <span class='text-[11px] mono px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'>.NET 9 LIVE TCP SOCKET</span>
           <span id='redisModeBadge' class='text-[11px] mono px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/30'>Redis</span>
         </div>
-        <p class='text-xs text-slate-400'>Äá»“ Ã¡n Láº­p trÃ¬nh máº¡ng (IEC_CNTT) â€¢ Real C# TcpListener (:9000) &amp; StackExchange.Redis</p>
+        <p class='text-xs text-slate-400'>Đồ án Lập trình mạng (IEC_CNTT) • Real C# TcpListener (:9000) &amp; StackExchange.Redis</p>
       </div>
     </div>
     <div class='text-xs mono text-slate-300 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800'>
@@ -290,11 +338,11 @@ namespace iec
     <section class='lg:col-span-8 flex flex-col gap-4'>
       <div class='grid grid-cols-4 gap-3'>
         <div class='bg-[#111827] border border-slate-800 rounded-xl p-3.5'>
-          <span class='text-xs text-slate-400'>Tá»•ng NhÃ¢n sá»± (SET)</span>
+          <span class='text-xs text-slate-400'>Tổng Nhân sự (SET)</span>
           <div id='kpiTotal' class='text-2xl font-bold mono mt-1'>0</div>
         </div>
         <div class='bg-[#111827] border border-emerald-900/50 rounded-xl p-3.5'>
-          <span class='text-xs text-emerald-400'>Äang Online (TTL &gt; 0)</span>
+          <span class='text-xs text-emerald-400'>Đang Online (TTL &gt; 0)</span>
           <div id='kpiOnline' class='text-2xl font-bold mono text-emerald-400 mt-1'>0</div>
         </div>
         <div class='bg-[#111827] border border-amber-900/50 rounded-xl p-3.5'>
@@ -302,31 +350,31 @@ namespace iec
           <div id='kpiBusy' class='text-2xl font-bold mono text-amber-400 mt-1'>0</div>
         </div>
         <div class='bg-[#111827] border border-slate-800 rounded-xl p-3.5'>
-          <span class='text-xs text-slate-400'>ÄÃ£ Offline (Háº¿t TTL)</span>
+          <span class='text-xs text-slate-400'>Đã Offline (Hết TTL)</span>
           <div id='kpiOffline' class='text-2xl font-bold mono text-slate-300 mt-1'>0</div>
         </div>
       </div>
 
       <div class='bg-[#111827] border border-slate-800 rounded-xl p-3 flex gap-2 items-center'>
-        <input id='broadcastInput' type='text' placeholder='Nháº­p thÃ´ng bÃ¡o Broadcast gá»­i qua C# NetworkStream tá»›i má»i nhÃ¢n viÃªn...' class='flex-1 bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500'>
-        <button onclick='sendBroadcast()' class='bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold px-4 py-2 rounded-lg transition'>PhÃ¡t TCP Broadcast</button>
+        <input id='broadcastInput' type='text' placeholder='Nhập thông báo Broadcast gửi qua C# NetworkStream tới mọi nhân viên...' class='flex-1 bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500'>
+        <button onclick='sendBroadcast()' class='bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold px-4 py-2 rounded-lg transition'>Phát TCP Broadcast</button>
       </div>
 
       <div class='bg-[#111827] border border-slate-800 rounded-xl overflow-hidden'>
         <div class='px-4 py-3 border-b border-slate-800 flex justify-between items-center'>
-          <span class='text-xs font-semibold uppercase tracking-wider text-slate-300'>GiÃ¡m sÃ¡t Tráº¡ng thÃ¡i NhÃ¢n viÃªn &amp; Bá»™ Ä‘áº¿m ngÆ°á»£c Redis TTL</span>
-          <span class='text-[11px] mono text-slate-400'>Click vÃ o 1 dÃ²ng Ä‘á»ƒ Ä‘iá»u khiá»ƒn á»Ÿ cá»™t pháº£i</span>
+          <span class='text-xs font-semibold uppercase tracking-wider text-slate-300'>Giám sát Trạng thái Nhân viên &amp; Bộ đếm ngược Redis TTL</span>
+          <span class='text-[11px] mono text-slate-400'>Click vào 1 dòng để điều khiển ở cột phải</span>
         </div>
         <table class='w-full text-left border-collapse'>
           <thead>
             <tr class='border-b border-slate-800 text-[11px] mono text-slate-400 bg-slate-900/60'>
-              <th class='py-2.5 px-4'>MÃƒ NV</th>
-              <th class='py-2.5 px-4'>Há»Œ VÃ€ TÃŠN</th>
-              <th class='py-2.5 px-4'>PHÃ’NG BAN</th>
-              <th class='py-2.5 px-4'>TRáº NG THÃI</th>
+              <th class='py-2.5 px-4'>MÃ NV</th>
+              <th class='py-2.5 px-4'>HỌ VÀ TÊN</th>
+              <th class='py-2.5 px-4'>PHÒNG BAN</th>
+              <th class='py-2.5 px-4'>TRẠNG THÁI</th>
               <th class='py-2.5 px-4 w-44'>REDIS TTL (15s)</th>
               <th class='py-2.5 px-4'>SOCKET IP</th>
-              <th class='py-2.5 px-4 text-right'>Cáº¬P NHáº¬T</th>
+              <th class='py-2.5 px-4 text-right'>CẬP NHẬT</th>
             </tr>
           </thead>
           <tbody id='staffBody' class='divide-y divide-slate-800/70 text-xs'></tbody>
@@ -335,8 +383,8 @@ namespace iec
 
       <div class='bg-[#111827] border border-slate-800 rounded-xl flex-1 flex flex-col overflow-hidden min-h-[210px]'>
         <div class='px-4 py-2 border-b border-slate-800 bg-slate-900/60 flex justify-between items-center'>
-          <span class='text-xs font-semibold text-cyan-400 mono'>GÃ³i tin C# TCP Socket &amp; Lá»‡nh Redis Thá»±c Táº¿</span>
-          <button onclick='clearLogs()' class='text-[11px] text-slate-400 hover:text-white'>XÃ³a Log</button>
+          <span class='text-xs font-semibold text-cyan-400 mono'>Gói tin C# TCP Socket &amp; Lệnh Redis Thực Tế</span>
+          <button onclick='clearLogs()' class='text-[11px] text-slate-400 hover:text-white'>Xóa Log</button>
         </div>
         <div id='logBox' class='p-3 mono text-[11px] space-y-1.5 overflow-y-auto max-h-52 bg-[#070a12]'></div>
       </div>
@@ -347,24 +395,24 @@ namespace iec
         <div class='border-b border-slate-800 pb-2.5 flex justify-between items-center'>
           <div>
             <span class='text-[10px] mono uppercase px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300'>Real C# TcpClient Control</span>
-            <h2 class='text-sm font-bold text-white mt-1'>TrÃ¬nh Äiá»u Khiá»ƒn NhÃ¢n ViÃªn</h2>
+            <h2 class='text-sm font-bold text-white mt-1'>Trình Điều Khiển Nhân Viên</h2>
           </div>
           <span id='simSocketBadge' class='text-[11px] mono px-2 py-1 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'>CONNECTED</span>
         </div>
 
         <div>
-          <label class='text-[11px] text-slate-400 block mb-1'>Chá»n NhÃ¢n viÃªn Ä‘ang thao tÃ¡c:</label>
+          <label class='text-[11px] text-slate-400 block mb-1'>Chọn Nhân viên đang thao tác:</label>
           <select id='empSelect' onchange='onSelectChange()' class='w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white mono'></select>
         </div>
 
         <div class='bg-slate-900/90 border border-slate-800 rounded-lg p-3 space-y-1.5 text-xs mono'>
           <div class='flex justify-between'><span class='text-slate-400'>Redis Key:</span><span id='simKey' class='text-cyan-400'>staff:online:NV01</span></div>
-          <div class='flex justify-between'><span class='text-slate-400'>PING Ä‘Ã£ gá»­i:</span><span id='simPings' class='text-emerald-400'>0 gÃ³i</span></div>
-          <div class='flex justify-between'><span class='text-slate-400'>Broadcast cuá»‘i:</span><span id='simBroadcast' class='text-amber-300 truncate max-w-[180px]'>ChÆ°a cÃ³</span></div>
+          <div class='flex justify-between'><span class='text-slate-400'>PING đã gửi:</span><span id='simPings' class='text-emerald-400'>0 gói</span></div>
+          <div class='flex justify-between'><span class='text-slate-400'>Broadcast cuối:</span><span id='simBroadcast' class='text-amber-300 truncate max-w-[180px]'>Chưa có</span></div>
         </div>
 
         <div>
-          <label class='text-[11px] text-slate-400 block mb-1.5'>Äá»•i tráº¡ng thÃ¡i qua gÃ³i tin STATUS|MÃ£_NV|...:</label>
+          <label class='text-[11px] text-slate-400 block mb-1.5'>Đổi trạng thái qua gói tin STATUS|Mã_NV|...:</label>
           <div class='grid grid-cols-3 gap-2'>
             <button onclick=""sendStatus('Online')"" class='py-2 rounded-lg text-xs font-semibold border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'>Online</button>
             <button onclick=""sendStatus('Busy')"" class='py-2 rounded-lg text-xs font-semibold border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'>Busy</button>
@@ -373,28 +421,28 @@ namespace iec
         </div>
 
         <div class='pt-2 border-t border-slate-800 space-y-2'>
-          <label class='text-[11px] text-slate-400 block'>Ká»‹ch báº£n Kiá»ƒm thá»­ Váº¥n Ä‘Ã¡p MÃ´n Láº­p trÃ¬nh máº¡ng:</label>
+          <label class='text-[11px] text-slate-400 block'>Kịch bản Kiểm thử Vấn đáp Môn Lập trình mạng:</label>
           <button onclick='killSocket()' class='w-full py-2.5 px-3 rounded-lg text-xs font-semibold bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 text-left flex justify-between items-center'>
-            <span>1. Giáº£ láº­p Sáº­p nguá»“n / Rá»›t máº¡ng (ÄÃ³ng Socket)</span>
-            <span class='mono text-[10px] bg-rose-950 px-1.5 py-0.5 rounded'>Chá» TTL 15s</span>
+            <span>1. Giả lập Sập nguồn / Rớt mạng (Đóng Socket)</span>
+            <span class='mono text-[10px] bg-rose-950 px-1.5 py-0.5 rounded'>Chờ TTL 15s</span>
           </button>
           <button onclick='logoutGraceful()' class='w-full py-2.5 px-3 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-left flex justify-between items-center'>
-            <span>2. ÄÄƒng xuáº¥t chuáº©n (Gá»­i LOGOUT|MÃ£_NV)</span>
-            <span class='mono text-[10px] bg-slate-900 px-1.5 py-0.5 rounded'>XÃ³a Key ngay</span>
+            <span>2. Đăng xuất chuẩn (Gửi LOGOUT|Mã_NV)</span>
+            <span class='mono text-[10px] bg-slate-900 px-1.5 py-0.5 rounded'>Xóa Key ngay</span>
           </button>
           <button onclick='reconnectSelected()' class='w-full py-2.5 px-3 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white text-center'>
-            Káº¿t ná»‘i láº¡i TCP &amp; Báº­t Heartbeat 5s
+            Kết nối lại TCP &amp; Bật Heartbeat 5s
           </button>
         </div>
 
         <div class='pt-2 border-t border-slate-800 space-y-2'>
-          <label class='text-[11px] text-slate-400 block'>ThÃªm káº¿t ná»‘i NhÃ¢n viÃªn má»›i (Má»Ÿ TcpClient má»›i):</label>
+          <label class='text-[11px] text-slate-400 block'>Thêm kết nối Nhân viên mới (Mở TcpClient mới):</label>
           <div class='grid grid-cols-3 gap-1.5'>
             <input id='newId' placeholder='NV04' class='bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs mono text-white'>
-            <input id='newName' placeholder='Há» tÃªn' class='bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs text-white'>
-            <input id='newDept' placeholder='PhÃ²ng' class='bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs text-white'>
+            <input id='newName' placeholder='Họ tên' class='bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs text-white'>
+            <input id='newDept' placeholder='Phòng' class='bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs text-white'>
           </div>
-          <button onclick='addNewStaff()' class='w-full py-2 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white'>+ Má»Ÿ káº¿t ná»‘i TCP NhÃ¢n viÃªn má»›i</button>
+          <button onclick='addNewStaff()' class='w-full py-2 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white'>+ Mở kết nối TCP Nhân viên mới</button>
         </div>
       </div>
     </aside>
@@ -438,7 +486,7 @@ namespace iec
         selectedEmpId = staffList[0].EmpId;
       }
       select.innerHTML = staffList.map(s =>
-        `<option value='${s.EmpId}' ${s.EmpId === selectedEmpId ? 'selected' : ''}>${s.EmpId} â€” ${s.FullName} (${s.IsOnline ? s.CurrentStatus : 'OFFLINE'})</option>`
+        `<option value='${s.EmpId}' ${s.EmpId === selectedEmpId ? 'selected' : ''}>${s.EmpId} — ${s.FullName} (${s.IsOnline ? s.CurrentStatus : 'OFFLINE'})</option>`
       ).join('');
 
       const tbody = document.getElementById('staffBody');
@@ -446,9 +494,9 @@ namespace iec
         const pct = Math.max(0, Math.min(100, (s.RemainingTtlSeconds / 15) * 100));
         let badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-slate-800 text-slate-400'>OFFLINE</span>`;
         if (s.IsOnline) {
-          if (s.CurrentStatus === 'Online') badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'>â— Online</span>`;
-          else if (s.CurrentStatus === 'Busy') badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-amber-500/15 text-amber-400 border border-amber-500/30'>â— Busy</span>`;
-          else badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-sky-500/15 text-sky-400 border border-sky-500/30'>â— Away</span>`;
+          if (s.CurrentStatus === 'Online') badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'>● Online</span>`;
+          else if (s.CurrentStatus === 'Busy') badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-amber-500/15 text-amber-400 border border-amber-500/30'>● Busy</span>`;
+          else badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-sky-500/15 text-sky-400 border border-sky-500/30'>● Away</span>`;
         }
         const barColor = !s.IsOnline ? 'bg-slate-700' : (s.RemainingTtlSeconds <= 6 ? 'bg-rose-500' : 'bg-emerald-500');
         const rowBg = s.EmpId === selectedEmpId ? 'bg-indigo-950/30' : 'hover:bg-slate-800/40';
@@ -473,8 +521,8 @@ namespace iec
       const cur = staffList.find(s => s.EmpId === selectedEmpId);
       if (cur) {
         document.getElementById('simKey').textContent = `staff:online:${cur.EmpId}`;
-        document.getElementById('simPings').textContent = `${cur.PingCount} gÃ³i PING`;
-        document.getElementById('simBroadcast').textContent = cur.LastBroadcast || 'ChÆ°a cÃ³';
+        document.getElementById('simPings').textContent = `${cur.PingCount} gói PING`;
+        document.getElementById('simBroadcast').textContent = cur.LastBroadcast || 'Chưa có';
         const b = document.getElementById('simSocketBadge');
         if (cur.IsSocketConnected) {
           b.textContent = 'SOCKET ACTIVE';
@@ -514,7 +562,7 @@ namespace iec
     }
     function addNewStaff() {
       const id = document.getElementById('newId').value.trim() || 'NV04';
-      const name = document.getElementById('newName').value.trim() || 'NhÃ¢n viÃªn Má»›i';
+      const name = document.getElementById('newName').value.trim() || 'Nhân viên Mới';
       const dept = document.getElementById('newDept').value.trim() || 'IT';
       selectedEmpId = id.toUpperCase();
       apiAction({ action: 'connect', empId: id, fullName: name, dept: dept });

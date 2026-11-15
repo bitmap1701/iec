@@ -28,12 +28,22 @@ namespace iec
     {
         public const int DefaultPort = 9000;
         public const int WebUiPort = 5050;
-        public const int HeartbeatIntervalMs = 5000; // Client gá»­i PING má»—i 5 giÃ¢y
-        public const int OnlineTtlSeconds = 15;      // KhÃ³a Redis tá»± há»§y sau 15 giÃ¢y náº¿u máº¥t PING
+        public const int HeartbeatIntervalMs = 5000; // Client gửi PING mỗi 5 giây
+        public const int OnlineTtlSeconds = 15;      // Khóa Redis tự hủy sau 15 giây nếu mất PING
 
         public const string CmdLogin = "LOGIN";
         public const string CmdPing = "PING";
         public const string CmdStatus = "STATUS";
         public const string CmdLogout = "LOGOUT";
+
+        // Chống lỗi Delimiter Injection (loại bỏ ký tự '|' hoặc xuống dòng làm hỏng khung gói tin TCP)
+        public static string Sanitize(string input, string fallback = "N/A")
+        {
+            if (string.IsNullOrWhiteSpace(input)) return fallback;
+            return input.Trim().Trim('\uFEFF')
+                        .Replace("|", "/")
+                        .Replace("\r", " ")
+                        .Replace("\n", " ");
+        }
     }
 }

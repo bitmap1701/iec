@@ -17,54 +17,65 @@ namespace iec
         private string _empId;
         private int _pingCount = 0;
 
+        // Khóa đồng bộ đảm bảo luồng Heartbeat 5s và luồng bấm nút Menu không ghi đè nhau trên NetworkStream
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
+
         public HrmTcpClient(string serverIp, int serverPort = HrmProtocol.DefaultPort)
         {
             _serverIp = serverIp;
             _serverPort = serverPort;
         }
 
+        private async Task SafeSendLineAsync(string payload)
+        {
+            await _writeLock.WaitAsync();
+            try
+            {
+                if (_client != null && _client.Connected && _writer != null)
+                {
+                    await _writer.WriteLineAsync(payload);
+                }
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
         public async Task StartClientInteractiveAsync()
         {
-            Console.Write("Nháº­p MÃ£ NhÃ¢n ViÃªn (VD: NV01): ");
-            _empId = Console.ReadLine()?.Trim().ToUpperInvariant();
-            if (string.IsNullOrEmpty(_empId)) _empId = "NV01";
+            Console.Write("Nhập Mã Nhân Viên (VD: NV04): ");
+            _empId = HrmProtocol.Sanitize(Console.ReadLine(), "NV04").ToUpperInvariant();
 
-            Console.Write("Nháº­p Há» vÃ  TÃªn (VD: Huynh Nhat Hoa): ");
-            string fullName = Console.ReadLine()?.Trim();
-            if (string.IsNullOrEmpty(fullName)) fullName = "Nhan Vien Test";
+            Console.Write("Nhập Họ và Tên (VD: Huynh Nhat Hoa): ");
+            string fullName = HrmProtocol.Sanitize(Console.ReadLine(), "Nhan Vien Test");
 
-            Console.Write("Nháº­p PhÃ²ng Ban (VD: IT): ");
-            string dept = Console.ReadLine()?.Trim();
-            if (string.IsNullOrEmpty(dept)) dept = "IT";
+            Console.Write("Nhập Phòng Ban (VD: IT): ");
+            string dept = HrmProtocol.Sanitize(Console.ReadLine(), "IT");
 
             try
             {
                 _client = new TcpClient();
-                Console.WriteLine($"Äang káº¿t ná»‘i TCP tá»›i {_serverIp}:{_serverPort}...");
+                Console.WriteLine($"Đang kết nối TCP tới {_serverIp}:{_serverPort}...");
                 await _client.ConnectAsync(_serverIp, _serverPort);
 
                 NetworkStream stream = _client.GetStream();
-                _reader = new StreamReader(stream, Encoding.UTF8);
-                _writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+                var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+                _reader = new StreamReader(stream, utf8NoBom);
+                _writer = new StreamWriter(stream, utf8NoBom) { AutoFlush = true };
 
-                // Gá»­i gÃ³i tin LOGIN Ä‘áº§u tiÃªn
-                await _writer.WriteLineAsync($"{HrmProtocol.CmdLogin}|{_empId}|{fullName}|{dept}");
+                await SafeSendLineAsync($"{HrmProtocol.CmdLogin}|{_empId}|{fullName}|{dept}");
 
                 using var cts = new CancellationTokenSource();
-
-                // 1. Luá»“ng láº¯ng nghe pháº£n há»“i & thÃ´ng bÃ¡o tá»« Server
                 _ = Task.Run(() => ListenServerAsync(cts.Token));
-
-                // 2. Luá»“ng tá»± Ä‘á»™ng báº¯n nhá»‹p tim PING má»—i 5 giÃ¢y
                 _ = Task.Run(() => HeartbeatLoopAsync(cts.Token));
 
-                // 3. Menu thao tÃ¡c cá»§a NhÃ¢n viÃªn
                 await EmployeeMenuLoopAsync(cts);
             }
             catch (Exception ex)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[Lá»–I Káº¾T Ná»I TCP] KhÃ´ng thá»ƒ káº¿t ná»‘i tá»›i Server ({_serverIp}:{_serverPort}): {ex.Message}");
+                Console.WriteLine($"[LỖI KẾT NỐI TCP] Không thể kết nối tới Server ({_serverIp}:{_serverPort}): {ex.Message}");
                 Console.ResetColor();
             }
         }
@@ -76,10 +87,7 @@ namespace iec
                 using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(HrmProtocol.HeartbeatIntervalMs));
                 while (await timer.WaitForNextTickAsync(token))
                 {
-                    if (_client != null && _client.Connected)
-                    {
-                        await _writer.WriteLineAsync($"{HrmProtocol.CmdPing}|{_empId}");
-                    }
+                    await SafeSendLineAsync($"{HrmProtocol.CmdPing}|{_empId}");
                 }
             }
             catch (OperationCanceledException) { }
@@ -93,10 +101,11 @@ namespace iec
                 string line;
                 while (!token.IsCancellationRequested && (line = await _reader.ReadLineAsync()) != null)
                 {
+                    line = line.Trim('\uFEFF', '\r', '\n');
                     if (line == "PONG")
                     {
                         _pingCount++;
-                        continue; // áº¨n PONG Ä‘á»ƒ khÃ´ng lÃ m trÃ´i mÃ n hÃ¬nh menu cá»§a nhÃ¢n viÃªn
+                        continue;
                     }
 
                     if (line.StartsWith("BROADCAST|"))
@@ -108,7 +117,7 @@ namespace iec
                     else
                     {
                         Console.ForegroundColor = ConsoleColor.Cyan;
-                        Console.WriteLine($"\n[PHáº¢N Há»’I SERVER] {line}");
+                        Console.WriteLine($"\n[PHẢN HỒI SERVER] {line}");
                         Console.ResetColor();
                     }
                 }
@@ -118,7 +127,7 @@ namespace iec
                 if (!token.IsCancellationRequested)
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("\n[Cáº¢NH BÃO] ÄÃ£ máº¥t káº¿t ná»‘i TCP vá»›i Server!");
+                    Console.WriteLine("\n[CẢNH BÁO] Đã mất kết nối TCP với Server!");
                     Console.ResetColor();
                 }
             }
@@ -128,36 +137,36 @@ namespace iec
         {
             while (!cts.IsCancellationRequested)
             {
-                Console.WriteLine($"\n--- Cá»¬A Sá»” NHÃ‚N VIÃŠN: {_empId} ---");
-                Console.WriteLine(" [1] Äá»•i tráº¡ng thÃ¡i sang: Online (Äang lÃ m viá»‡c)");
-                Console.WriteLine(" [2] Äá»•i tráº¡ng thÃ¡i sang: Busy (Äang báº­n / Há»p)");
-                Console.WriteLine(" [3] Äá»•i tráº¡ng thÃ¡i sang: Away (Táº¡m rá»i mÃ¡y)");
-                Console.WriteLine(" [4] Xem sá»‘ nhá»‹p tim (Heartbeat PING/PONG) Ä‘Ã£ gá»­i thÃ nh cÃ´ng");
-                Console.WriteLine(" [0] ÄÄƒng xuáº¥t chuáº©n (LOGOUT) | (Hoáº·c táº¯t ngang cá»­a sá»• Ä‘á»ƒ test TTL 15s)");
-                Console.Write("Chá»n thao tÃ¡c: ");
+                Console.WriteLine($"\n--- CỬA SỔ NHÂN VIÊN: {_empId} ---");
+                Console.WriteLine(" [1] Đổi trạng thái sang: Online (Đang làm việc)");
+                Console.WriteLine(" [2] Đổi trạng thái sang: Busy (Đang bận / Họp)");
+                Console.WriteLine(" [3] Đổi trạng thái sang: Away (Tạm rời máy)");
+                Console.WriteLine(" [4] Xem số nhịp tim (Heartbeat PING/PONG) đã gửi thành công");
+                Console.WriteLine(" [0] Đăng xuất chuẩn (LOGOUT) | (Hoặc tắt ngang cửa sổ để test TTL 15s)");
+                Console.Write("Chọn thao tác: ");
 
                 string choice = Console.ReadLine()?.Trim();
                 if (choice == "1")
                 {
-                    await _writer.WriteLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Online");
+                    await SafeSendLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Online");
                 }
                 else if (choice == "2")
                 {
-                    await _writer.WriteLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Busy");
+                    await SafeSendLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Busy");
                 }
                 else if (choice == "3")
                 {
-                    await _writer.WriteLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Away");
+                    await SafeSendLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Away");
                 }
                 else if (choice == "4")
                 {
                     Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"-> ÄÃ£ duy trÃ¬ {_pingCount} nhá»‹p tim PING/PONG thÃ nh cÃ´ng vá»›i Server.");
+                    Console.WriteLine($"-> Đã duy trì {_pingCount} nhịp tim PING/PONG thành công với Server.");
                     Console.ResetColor();
                 }
                 else if (choice == "0")
                 {
-                    await _writer.WriteLineAsync($"{HrmProtocol.CmdLogout}|{_empId}");
+                    await SafeSendLineAsync($"{HrmProtocol.CmdLogout}|{_empId}");
                     await Task.Delay(300);
                     cts.Cancel();
                     _client.Close();

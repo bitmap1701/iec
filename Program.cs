@@ -13,7 +13,7 @@ namespace iec
             Console.InputEncoding = Encoding.UTF8;
 
             Console.WriteLine("================================================================");
-            Console.WriteLine("   PULSE HRM MINI - TCP SOCKET & REDIS (.NET 9 CROSS-PLATFORM)  ");
+            Console.WriteLine("   IEC PRESENCE MONITOR - TCP SOCKET & REDIS (.NET 9)           ");
             Console.WriteLine("   Môn học: Lập trình mạng (IEC_CNTT) - Windows & macOS Ready   ");
             Console.WriteLine("================================================================");
             Console.WriteLine(" [1] Khởi chạy ADMIN SERVER + GIAO DIỆN WEB COCKPIT (Port 9000 & 5050)");
@@ -47,7 +47,10 @@ namespace iec
 
                 using var cts = new CancellationTokenSource();
                 var server = new HrmTcpServer(redisService, HrmProtocol.DefaultPort);
-                server.StartBackgroundListener(cts.Token);
+                if (!server.StartBackgroundListener(cts.Token))
+                {
+                    return;
+                }
 
                 var webUi = new WebDashboardHost(redisService, server, HrmProtocol.WebUiPort);
                 await webUi.StartAsync(cts.Token);

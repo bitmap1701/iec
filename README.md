@@ -1,132 +1,148 @@
-# IEC — Hệ thống Quản trị & Định vị Trạng thái Nhân sự Thời gian thực (TCP Socket & Redis)
+# IEC — Hệ thống Quản trị, Định vị Trạng thái & Giao tiếp Nhân sự Thời gian thực (TCP/UDP Socket & Redis)
 
 > **Học phần:** Lập trình mạng (Network Programming — `IEC_CNTT`)  
-> **Nền tảng:** C# .NET 9.0 Cross-Platform (Chạy đồng nhất trên **Windows** & **macOS**)  
-> **Công nghệ cốt lõi:** `System.Net.Sockets` (`TcpListener` / `TcpClient` / `NetworkStream`), `StackExchange.Redis`, `HttpListener`  
-> **Kiến trúc:** Multi-threaded Asynchronous TCP Socket Server kết hợp Redis In-Memory State (Set, Hash, String TTL)
+> **Nền tảng:** C# .NET 9.0 Cross-Platform (Tương thích đồng nhất trên **Windows** & **macOS**)  
+> **Giao thức mạng:** `TcpListener` / `TcpClient` (Cổng `9000`), `UdpClient` Auto-Discovery (Cổng `9001`), `HttpListener` Web Cockpit (Cổng `5050`)  
+> **Kiến trúc dữ liệu:** `StackExchange.Redis` (Khai thác 5 cấu trúc: `SET`, `HASH`, `STRING + TTL`, `ZSET`, `LIST` & `Atomic Counter Rate-Limiter`) kèm cơ chế **In-Memory Fallback** tự động.
 
 ---
 
-## 1. Tổng quan Bài toán & Mục tiêu Đồ án
+## 1. Tổng quan Bài toán & Giải pháp Kiến trúc
 
-Trong các hệ thống quản lý nhân sự nội bộ (LAN), bài toán khó nhất của tầng giao vận mạng là phát hiện chính xác trạng thái **Online / Offline thực tế** khi xảy ra sự cố vật lý:
-- Nếu nhân viên bấm nút **Đăng xuất (`LOGOUT`)**, ứng dụng gửi gói tin báo cho Server biết để ngắt kết nối ngay lập tức.
-- Nhưng nếu máy tính nhân viên **sập nguồn đột ngột, đứt cáp LAN, rớt Wi-Fi hoặc bị tắt ngang tiến trình (`Kill Process`)**, hệ điều hành phía Client không kịp gửi gói tin `TCP FIN/RST`. Khi đó, Socket phía Server rơi vào trạng thái **Half-Open Connection (Kết nối treo một nửa)**, dẫn đến hiện tượng **"Online ảo" (Ghost Online)**.
+Trong các hệ thống quản trị nhân sự qua mạng nội bộ (LAN), thách thức lớn nhất của tầng giao vận mạng là **xác định chính xác trạng thái kết nối thực tế** và **đồng bộ dữ liệu thời gian thực** giữa nhiều thiết bị:
+1. **Bài toán "Online ảo" (Half-Open TCP Connection / Ghost Online):** Khi nhân viên bấm đăng xuất (`LOGOUT`), Client gửi gói tin báo Server đóng kết nối ngay. Nhưng nếu máy tính nhân viên **sập nguồn đột ngột, rớt Wi-Fi, rút cáp LAN hoặc bị tắt ngang tiến trình (`Kill Process`)**, hệ điều hành Client không thể gửi cờ `TCP FIN/RST`. Socket phía Server bị treo nửa vời và báo nhân viên Online ảo suốt cả ngày.
+2. **Bài toán Tìm kiếm Máy chủ trong mạng LAN động (DHCP IP):** Khi triển khai giữa nhiều laptop trên giảng đường, địa chỉ IPv4 của Server thay đổi liên tục theo mạng Wi-Fi/Hotspot.
+3. **Bài toán Đa luồng & Bảo mật Gói tin (Concurrency & TCP Flood):** Khi hàng chục Client cùng gửi nhịp tim `PING`, đổi trạng thái, chat nội bộ hoặc khi một Client bị lỗi vòng lặp bắn hàng loạt gói tin gây nghẽn mạng.
 
-Dự án **IEC (`iec`)** giải quyết triệt để vấn đề này bằng sự kết hợp giữa **Lập trình Socket (Heartbeat 5s)** và **Cơ chế Khóa tự hủy (TTL 15s) của Redis**:
-1. Mỗi `Employee Client` duy trì kết nối TCP tới Server ở cổng `9000` và định kỳ bắn gói tin nhịp tim `PING|<Mã_NV>` mỗi **5 giây**.
-2. Mỗi lần nhận được `PING`, `Admin Server` gọi lệnh `EXPIRE` gia hạn khóa `staff:online:<Mã_NV>` trên Redis lên **15 giây**.
-3. Nếu Client mất kết nối đột ngột, luồng `PING` dừng lại -> Đúng **15 giây** sau, khóa trên Redis tự động bốc hơi khỏi RAM -> Nhân viên tự động chuyển về **`OFFLINE`** mà không làm treo Server.
+**Giải pháp của hệ thống IEC (`iec`):**
+- **Tự động dò tìm Server bằng UDP Broadcast (`Port 9001`):** Client phát gói tin quảng bá UDP tìm Server trong mạng LAN trước khi thiết lập kết nối TCP tin cậy ở cổng `9000`.
+- **Cơ chế Nhịp tim TCP (`Heartbeat 5s`) + Khóa tự hủy Redis (`TTL 15s`):** Client gửi gói tin `PING` kèm mốc thời gian mỗi 5 giây để đo độ trễ khứ hồi (`RTT ms`) và gia hạn khóa `staff:online:<Mã_NV>` trên Redis thêm 15 giây. Nếu mất mạng đột ngột, sau đúng 15 giây khóa Redis tự hủy và nhân viên chuyển về **`OFFLINE`**.
+- **Tích hợp 5 Cấu trúc Dữ liệu Redis & Tường lửa Chống Spam (`Rate-Limiter`):** Quản lý đồng bộ danh sách nhân sự (`SET`), hồ sơ & công việc (`HASH`), bảng xếp hạng thời gian trực tuyến (`ZSET`), lịch sử tin nhắn phát lại (`LIST`) và bộ đếm chặn tấn công ngập lụt gói tin (`INCR + EXPIRE`).
 
 ---
 
-## 2. Phân tích Chi tiết Cấu trúc Thư mục: Chức năng, Đóng góp & Tác động (Impact)
+## 2. Phân tích Cấu trúc Thư mục: Chức năng, Đóng góp & Tác động (Impact)
 
 ```text
 iec/
-├── iec.csproj                # [Cấu hình] Khai báo SDK .NET 9.0 & thư viện StackExchange.Redis
-├── StaffMember.cs            # [Data Model & Protocol] Định nghĩa thực thể & từ điển giao thức TCP
-├── RedisPresenceService.cs   # [Data & State Layer] Quản lý Redis (Set, Hash, TTL) & In-Memory Fallback
-├── HrmTcpServer.cs           # [Core Network Server] Lõi TcpListener đa luồng (Cổng 9000)
-├── HrmTcpClient.cs           # [Core Network Client] Lõi TcpClient & Bộ phát nhịp tim (Heartbeat 5s)
-├── WebDashboardHost.cs       # [Web Cockpit & Bridge] Giao diện giám sát (Cổng 5050) & Cầu nối TCP thật
-├── Program.cs                # [Entry Point] Bộ điều phối khởi chạy đa nền tảng Windows / macOS
-├── .gitignore                # [Git Config] Chặn đẩy thư mục biên dịch tạm (bin/, obj/) lên GitHub
-└── README.md                 # [Documentation] Tài liệu kiến trúc, giao thức và kịch bản kiểm thử
+├── iec.csproj                # [Project Config] Cấu hình SDK .NET 9.0 & gói NuGet StackExchange.Redis
+├── StaffMember.cs            # [Data Model & Protocol] Thực thể nhân sự, từ điển lệnh & bộ lọc Sanitize()
+├── RedisPresenceService.cs   # [Redis State Layer] Tầng xử lý 5 cấu trúc Redis, Rate-Limit & In-Memory Fallback
+├── HrmTcpServer.cs           # [Core Network Server] Máy chủ TCP (:9000) + UDP (:9001) đa luồng bất đồng bộ
+├── HrmTcpClient.cs           # [Core Network Client] Máy khách TCP/UDP, bộ phát nhịp tim 5s & đo độ trễ RTT
+├── WebDashboardHost.cs       # [Web Cockpit & Bridge] Giao diện giám sát (:5050) & Cầu nối điều khiển Socket thật
+├── Program.cs                # [Unified Entry Point] Bộ điều phối khởi chạy hợp nhất trên Windows & macOS
+├── .gitignore                # [Git Hygiene] Loại bỏ thư mục biên dịch tạm (bin/, obj/) khỏi kho lưu trữ
+└── README.md                 # [Documentation] Tài liệu kiến trúc mạng, thiết kế Redis và kịch bản nghiệm thu
 ```
 
 ### Bảng Phân tích Chuyên sâu Từng Thành phần trong Dự án
 
-#### 2.1. `iec.csproj` — Cấu hình Môi trường & Phụ thuộc
-- **Làm gì (Chức năng):** Định nghĩa Target Framework là `net9.0`, kiểu đầu ra là ứng dụng thực thi (`Exe`) và khai báo gói thư viện `StackExchange.Redis`.
-- **Đóng góp gì cho bài:** Đảm bảo mã nguồn không phụ thuộc vào thư viện giao diện riêng của Windows (như WinForms hay WPF), giúp cùng một bộ code biên dịch được trên cả Windows và macOS.
-- **Impact (Tác động tới dự án):** Là nền móng tương thích đa nền tảng. Nhờ thiết kế file `.csproj` tối giản, thành viên dùng macOS hoặc Windows chỉ cần gõ `dotnet run` là NuGet tự động tải đúng gói thư viện tương ứng với kiến trúc chip (Intel x64 hoặc Apple Silicon M-series).
+#### 2.1. `iec.csproj` — Cấu hình Môi trường Đa Nền Tảng
+- **Làm gì:** Khai báo Target Framework `net9.0`, kiểu đầu ra `Exe` và thư viện `StackExchange.Redis`.
+- **Đóng góp cho bài:** Loại bỏ sự phụ thuộc vào các thư viện giao diện chỉ chạy trên Windows (như WinForms/WPF).
+- **Impact (Tác động):** Giúp mã nguồn biên dịch và chạy đồng nhất 100% trên cả **Windows** và **macOS** chỉ với lệnh `dotnet run`.
 
-#### 2.2. `StaffMember.cs` — Hợp đồng Dữ liệu & Chuẩn hóa Giao thức (`HrmProtocol`)
-- **Làm gì (Chức năng):** Chứa 3 thành phần:
-  1. Class `StaffMember`: Lưu thông tin nhân sự (`EmpId`, `FullName`, `Department`, `ClientIp`, `CurrentStatus`, `RemainingTtlSeconds`, `PingCount`).
-  2. Class `TcpLogEntry`: Định dạng dòng nhật ký gói tin (`Time`, `Tag`, `Message`).
-  3. Static class `HrmProtocol`: Cố định các hằng số mạng (`DefaultPort = 9000`, `WebUiPort = 5050`, `HeartbeatIntervalMs = 5000`, `OnlineTtlSeconds = 15`) và các từ khóa lệnh (`LOGIN`, `PING`, `STATUS`, `LOGOUT`).
-- **Đóng góp gì cho bài:** Đóng vai trò là **"Hợp đồng giao thức" (Protocol Contract)** dùng chung cho cả Server và Client, loại bỏ hoàn toàn lỗi gõ sai chuỗi lệnh (*Magic Strings*) hoặc lệch cổng kết nối.
-- **Impact (Tác động tới dự án):** Nếu muốn thay đổi chu kỳ nhịp tim (ví dụ từ 5s xuống 3s) hoặc đổi thời gian hết hạn TTL (từ 15s sang 30s) khi demo cho giảng viên, nhóm chỉ cần sửa duy nhất 1 con số tại file này là cả Server, Client và Redis đều tự động đồng bộ theo.
+#### 2.2. `StaffMember.cs` — Hợp đồng Giao thức (`HrmProtocol`) & An toàn Khung Gói tin
+- **Làm gì:** Định nghĩa các lớp dữ liệu (`StaffMember`, `TcpLogEntry`, `ChatMessageEntry`), các hằng số giao thức (`DefaultPort = 9000`, `UdpDiscoveryPort = 9001`, `HeartbeatIntervalMs = 5000`, `OnlineTtlSeconds = 15`) và hàm lọc `HrmProtocol.Sanitize()`.
+- **Đóng góp cho bài:** Đóng vai trò là "Hợp đồng giao thức" dùng chung giữa Server và Client, khử ký tự ẩn UTF-8 BOM (`\uFEFF`) và lọc ký tự phân tách `|`.
+- **Impact (Tác động):** Ngăn chặn triệt để lỗi **Delimiter Injection** (người dùng nhập ký tự `|` hoặc xuống dòng làm vỡ cấu trúc `Split('|')` trên luồng TCP) và giúp thay đổi cấu hình mạng tại một nơi duy nhất.
 
-#### 2.3. `RedisPresenceService.cs` — Tầng Quản trị Trạng thái Thời gian thực & Tự phục hồi (Fallback)
-- **Làm gì (Chức năng):** Đóng gói toàn bộ lệnh đọc/ghi tới Redis thông qua 3 cấu trúc dữ liệu:
-  - `SET (staff:ids)`: Lưu danh sách mã nhân viên duy nhất.
-  - `HASH (staff:profile:{empId})`: Lưu hồ sơ tĩnh (`FullName`, `Department`, `ClientIp`, `LastSeen`).
-  - `STRING + TTL (staff:online:{empId})`: Lưu trạng thái động (`Online`/`Busy`/`Away`) kèm bộ đếm ngược tự hủy 15 giây.
-  - Đặc biệt: Tích hợp bộ máy **`In-Memory Redis Engine Fallback`** bằng `ConcurrentDictionary` có tính toán thời gian hết hạn `ExpireAt`.
-- **Đóng góp gì cho bài:** Tách biệt hoàn toàn logic lưu trữ dữ liệu ra khỏi logic xử lý mạng Socket (Separation of Concerns).
-- **Impact (Tác động tới dự án):**
-  1. **Về hiệu năng:** Truy xuất trạng thái Online/Offline với độ phức tạp $O(1)$ trên RAM, không cần quét `KEYS *` gây nghẽn Redis.
-  2. **Về tính sẵn sàng khi chấm bài:** Nhờ cơ chế *Fallback*, nếu máy của thành viên nhóm hoặc máy phòng Lab chưa cài đặt dịch vụ Redis Server ở cổng `6379`, chương trình **không bị văng lỗi kết nối** mà tự động chuyển sang chế độ giả lập Redis trên RAM với hành vi đếm ngược TTL 15s giống hệt Redis thật.
+#### 2.3. `RedisPresenceService.cs` — Tầng Quản trị Trạng thái Redis & Cơ chế Tự phục hồi (`Fallback`)
+- **Làm gì:** Đóng gói toàn bộ lệnh giao tiếp với Redis Server qua 5 cấu trúc dữ liệu (`SET`, `HASH`, `STRING + TTL`, `ZSET`, `LIST`), bộ đếm chống spam (`Rate-Limiter`) và bộ máy **`In-Memory 5-Struct Redis Engine Fallback`**.
+- **Đóng góp cho bài:** Tách biệt hoàn toàn logic lưu trữ trạng thái trên RAM ra khỏi logic truyền nhận Socket (Separation of Concerns).
+- **Impact (Tác động):**
+  1. Đảm bảo tốc độ đọc/ghi trạng thái khi hàng chục Client bắn `PING` liên tục đạt dưới 1 mili-giây mà không gây nghẽn ổ cứng (Disk I/O).
+  2. Nhờ cơ chế **Fallback tự động**, nếu chạy trên máy phòng Lab hoặc máy macOS chưa bật dịch vụ Redis cổng `6379`, ứng dụng tự động chuyển sang bộ nhớ giả lập trên RAM hỗ trợ đầy đủ cả 5 cấu trúc và bộ đếm ngược TTL 15s mà không bị dừng chương trình.
 
-#### 2.4. `HrmTcpServer.cs` — Trái tim của Đồ án Môn Lập trình Mạng (`TcpListener`)
-- **Làm gì (Chức năng):**
-  - Mở cổng TCP `9000` qua `TcpListener(IPAddress.Any, 9000)` để lắng nghe kết nối trên mọi card mạng (`127.0.0.1`, Wi-Fi LAN, Hotspot).
-  - Sử dụng vòng lặp bất đồng bộ `AcceptTcpClientAsync()` kết hợp `Task.Run(() => HandleClientAsync(client))` để phục vụ hàng chục nhân viên kết nối đồng thời mà không chặn luồng chính (Non-blocking Multi-client).
-  - Đọc luồng byte từ `NetworkStream` qua `StreamReader`, bóc tách gói tin theo ký tự phân tách `|` (`LOGIN`, `PING`, `STATUS`, `LOGOUT`), gọi `RedisPresenceService` cập nhật trạng thái và phản hồi lại Client qua `StreamWriter`.
-  - Lưu danh sách các kết nối đang sống vào `ConcurrentDictionary<string, StreamWriter>` để phát thông báo `BROADCAST` từ Admin xuống toàn bộ nhân viên.
-- **Đóng góp gì cho bài:** Thể hiện trực tiếp kiến thức cốt lõi của môn **Lập trình mạng**: quản lý vòng đời Socket, lập trình bất đồng bộ `async/await`, xử lý đa luồng an toàn (`Thread-safe`) và bắt ngoại lệ rớt mạng (`catch IOException`).
-- **Impact (Tác động tới dự án):** Đây là thành phần quyết định điểm số kỹ thuật của đồ án. Nếu một Client bị tắt ngang, khối `catch (IOException)` và `finally` trong file này sẽ cô lập lỗi của riêng Client đó, thu hồi tài nguyên Socket sạch sẽ mà không làm ảnh hưởng đến các nhân viên khác đang kết nối.
+#### 2.4. `HrmTcpServer.cs` — Máy chủ Lập trình Mạng Đa luồng (`TcpListener` & `UdpClient`)
+- **Làm gì:**
+  - Mở cổng TCP `9000` (`TcpListener`) chấp nhận nhiều kết nối đồng thời qua `AcceptTcpClientAsync()` + `Task.Run()`.
+  - Mở cổng UDP `9001` (`UdpClient`) lắng nghe gói tin `DISCOVER_IEC_SERVER` và tự động phản hồi địa chỉ IPv4 LAN của Server.
+  - Bọc mỗi kết nối vào lớp **`ClientSession`** có khóa `SemaphoreSlim(1, 1)` để đồng bộ hóa luồng ghi `StreamWriter`.
+- **Đóng góp cho bài:** Thể hiện trực tiếp các kỹ thuật cốt lõi của môn Lập trình mạng: kết hợp UDP (Connectionless) và TCP (Connection-oriented), xử lý bất đồng bộ `async/await`, quản lý phiên an toàn luồng (`Thread-safe`) và định tuyến bản tin (Broadcast & Unicast DM).
+- **Impact (Tác động):** Khóa `SemaphoreSlim` trong `ClientSession` loại bỏ hoàn toàn lỗi xung đột luồng (`InvalidOperationException: stream in use`) khi Server vừa trả lời `PONG` vừa đẩy tin nhắn `BROADCAST` xuống cùng một Client.
 
-#### 2.5. `HrmTcpClient.cs` — Ứng dụng Đầu cuối Nhân viên & Bộ phát Nhịp tim (`TcpClient`)
-- **Làm gì (Chức năng):**
-  - Khởi tạo `TcpClient`, kết nối tới IP và cổng `9000` của Server, đồng bộ luồng gửi bằng `SemaphoreSlim(1, 1)`.
-  - Sau khi gửi bản tin `LOGIN`, kích hoạt đồng thời 3 luồng tác vụ chạy song song:
-    1. `HeartbeatLoopAsync`: Dùng `PeriodicTimer` của .NET để tự động bắn gói tin `PING|<Mã_NV>` mỗi 5 giây.
-    2. `ListenServerAsync`: Lắng nghe liên tục phản hồi `PONG`, `STATUS_OK` và tin nhắn `BROADCAST` từ Admin đẩy xuống.
-    3. `EmployeeMenuLoopAsync`: Giao diện dòng lệnh cho phép nhân viên chủ động đổi trạng thái (`Online`/`Busy`/`Away`) hoặc gửi lệnh `LOGOUT`.
-- **Đóng góp gì cho bài:** Chứng minh khả năng giao tiếp **Song công toàn phần (Full-Duplex)** trên một kết nối TCP duy nhất (vừa gửi `PING`/`STATUS` định kỳ, vừa nhận `BROADCAST` bất kỳ lúc nào từ Server).
-- **Impact (Tác động tới dự án):** Cho phép chạy độc lập trên một máy tính thứ hai (ví dụ máy macOS kết nối qua mạng LAN vào máy Windows đang chạy Server) để chứng minh tính thực tế của mô hình mạng phân tán.
+#### 2.5. `HrmTcpClient.cs` — Ứng dụng Đầu cuối Nhân viên (`TcpClient` & `PeriodicTimer`)
+- **Làm gì:**
+  - Phát gói tin UDP Broadcast cổng `9001` để tự động tìm IP Server trong mạng LAN, sau đó kết nối TCP vào cổng `9000`.
+  - Vận hành song song 3 luồng tác vụ: `HeartbeatLoopAsync` (bắn `PING` mỗi 5s kèm Timestamp), `ListenServerAsync` (đo độ trễ `RTT ms` khi nhận `PONG`, nhận `BROADCAST` và lịch sử `REPLAY`), và `EmployeeMenuLoopAsync` (đổi trạng thái, cập nhật Task, gửi Chat/DM, kiểm thử Spam Flood).
+- **Đóng góp cho bài:** Chứng minh khả năng truyền thông **Song công toàn phần (Full-Duplex)** trên một kết nối TCP duy nhất.
+- **Impact (Tác động):** Cho phép chạy độc lập trên nhiều máy tính vật lý khác nhau (Windows PC, Laptop phụ, MacBook) cùng kết nối về Server trung tâm.
 
-#### 2.6. `WebDashboardHost.cs` — Giao diện Giám sát Trực quan & Trình Điều khiển Socket Thật
-- **Làm gì (Chức năng):**
-  - Khởi chạy một Web Server nội bộ nhẹ bằng `HttpListener` tại `http://localhost:5050/`.
-  - Cung cấp giao diện **Dark-Mode Cockpit** hiển thị trực tiếp thanh tiến trình đếm ngược TTL 15 giây của từng nhân viên và cửa sổ nhật ký gói tin TCP thời gian thực.
-  - Quản lý các đối tượng `ManagedSimClient` (bên trong là các `TcpClient` thật kết nối thẳng vào cổng `9000` của `HrmTcpServer`).
-- **Đóng góp gì cho bài:** Giải quyết bài toán giao diện đồ họa (GUI) đa nền tảng mà không cần dùng WinForms (vốn không hỗ trợ trên macOS).
-- **Impact (Tác động tới dự án):** Giúp buổi báo cáo đồ án trở nên trực quan. Khi bấm nút *"Giả lập Sập nguồn (Đóng Socket)"* trên trình duyệt, C# đóng thật kết nối `TcpClient` ngầm và cả nhóm nhìn thấy ngay thanh TTL đếm ngược từng giây từ `15s` về `0s` trước khi chuyển sang `OFFLINE`.
+#### 2.6. `WebDashboardHost.cs` — Giao diện Giám sát Trực quan & Cầu nối Socket Thật
+- **Làm gì:** Khởi chạy máy chủ HTTP nhẹ (`HttpListener` cổng `5050`) cung cấp giao diện **Dark-Mode Cockpit** và quản lý các đối tượng `ManagedSimClient` (kết nối `TcpClient` thật vào cổng `9000`).
+- **Đóng góp cho bài:** Mang lại giao diện đồ họa trực quan trên mọi hệ điều hành mà mọi thao tác bấm nút đều đi qua đường ống `NetworkStream` thật 100%.
+- **Impact (Tác động):** Giúp quan sát trực tiếp thanh đếm ngược `REDIS TTL (15s)`, độ trễ `RTT (ms)`, bảng xếp hạng `UPTIME (ZSET)` và cảnh báo khóa `SECOPS BLOCKED` theo từng giây khi bảo vệ đồ án.
 
 #### 2.7. `Program.cs` — Điểm Khởi chạy Hợp nhất (Unified Entry Point)
-- **Làm gì (Chức năng):** Cấu hình bảng mã `UTF-8` cho Console, hiển thị menu cho phép người dùng chọn chạy chế độ **[1] Admin Server + Web UI** hoặc **[2] Employee Client** ngay trong cùng một project.
-- **Đóng góp gì cho bài:** Gom cả Server và Client vào chung một Solution/Project gọn nhẹ, giúp việc chia sẻ code và chạy kiểm thử nhiều cửa sổ Terminal cực kỳ nhanh chóng.
-- **Impact (Tác động tới dự án):** Giảm thiểu rủi ro lệch phiên bản code giữa project Server và project Client khi làm việc nhóm trên GitHub.
+- **Làm gì:** Thiết lập bảng mã `UTF-8` và điều phối menu chọn vai trò **[1] Admin Server + Web Cockpit** hoặc **[2] Employee Client**.
+- **Đóng góp & Impact:** Gom cả Server và Client vào chung một dự án gọn nhẹ, đồng bộ 100% phiên bản giao thức khi làm việc nhóm qua GitHub.
 
 ---
 
-## 3. Đặc tả Giao thức Truyền thông (Application-Layer TCP Protocol)
+## 3. Kiến trúc 6 Cơ chế Redis trong Dự án & Mối liên hệ với Lập trình Mạng
 
-Các bản tin được truyền dưới dạng văn bản `UTF-8`, kết thúc bằng ký tự xuống dòng (`\n` - Line-delimited framing) và phân tách trường bằng dấu `|`:
-
-| Lệnh | Chiều truyền | Cú pháp Gói tin | Hành động tại TCP Server & Redis | Phản hồi TCP |
-| :--- | :---: | :--- | :--- | :--- |
-| **`LOGIN`** | Client -> Server | `LOGIN\|<EmpId>\|<FullName>\|<Dept>` | `SADD staff:ids`, `HSET staff:profile:<Id>`, `SETEX staff:online:<Id> 15 "Online"` | `LOGIN_OK\|...` |
-| **`PING`** | Client -> Server | `PING\|<EmpId>` | `EXPIRE staff:online:<Id> 15`, cập nhật `LastSeen` trong Hash | `PONG` |
-| **`STATUS`** | Client -> Server | `STATUS\|<EmpId>\|<Online/Busy/Away>` | `SETEX staff:online:<Id> 15 "<Status>"`, cập nhật `LastSeen` | `STATUS_OK\|...` |
-| **`LOGOUT`** | Client -> Server | `LOGOUT\|<EmpId>` | `DEL staff:online:<Id>` (Chuyển sang `OFFLINE` tức thì), đóng Socket | `BYE` |
-| **`BROADCAST`** | Server -> Clients | `BROADCAST\|[THÔNG BÁO]: <Nội dung>` | Server duyệt qua `ConcurrentDictionary` các Socket đang mở và đẩy tin nhắn xuống | *(Hiển thị ngay ở Client)* |
+| Cơ chế / Cấu trúc Redis | Khóa (Key Pattern) | Lệnh Redis Tương ứng | Giải quyết Bài toán gì cho Lập trình Mạng? |
+| :--- | :--- | :--- | :--- |
+| **1. `Redis SET`** | `staff:ids` | `SADD`, `SMEMBERS` | Lưu danh sách mã nhân viên duy nhất (`NV01`, `NV02`...), giúp Server duyệt quân số với độ phức tạp $O(N)$ mà không dùng lệnh cấm `KEYS *`. |
+| **2. `Redis HASH`** | `staff:profile:{Id}` | `HSET`, `HGETALL` | Lưu hồ sơ nhân viên (`FullName`, `Department`, `ClientIp`, `LastSeen`, `CurrentTask`, `RttMs`). Giữ nguyên thông tin ngay cả khi Socket đã ngắt. |
+| **3. `Redis STRING + TTL`** | `staff:online:{Id}` | `SETEX ... 15`, `EXPIRE ... 15`, `DEL` | **Trái tim phát hiện rớt mạng:** Lưu trạng thái (`Online`/`Busy`/`Away`) kèm bộ đếm ngược 15s. Tự động xóa khóa khi mất nhịp tim `PING` do đứt mạng. |
+| **4. `Redis ZSET`** | `staff:leaderboard:uptime` | `ZINCRBY ... 5`, `ZSCORE` | Cộng lũy kế 5 giây mỗi nhịp tim `PING` thành công, tự động xếp hạng nhân viên chuyên cần theo thời gian thực với độ phức tạp $O(\log N)$. |
+| **5. `Redis LIST`** | `staff:chat:history` | `LPUSH`, `LTRIM 0 49`, `LRANGE` | Lưu 50 tin nhắn Chat/DM/Task mới nhất trên RAM để **phát lại (Offline Message Replay)** cho các Socket vừa kết nối vào sau. |
+| **6. `Atomic Counter`** | `security:ratelimit:{Id}` | `INCR`, `EXPIRE ... 10` | **Tường lửa tầng Ứng dụng:** Đếm số gói tin TCP gửi lên trong mỗi cửa sổ 10 giây. Nếu vượt quá 25 gói/10s, tự động khóa tài khoản 30s và ngắt Socket. |
 
 ---
 
-## 4. Hướng dẫn Cài đặt & Chạy Kiểm thử (Windows & macOS)
+## 4. Đặc tả Giao thức Tầng Ứng dụng (TCP Port `9000` & UDP Port `9001`)
 
-### Bước 1: Tải dự án & Khởi chạy Admin Server + Giao diện Web Cockpit
+| Giao thức | Lệnh | Cú pháp Bản tin | Xử lý tại Server & Tác động lên Redis | Phản hồi Mạng |
+| :---: | :--- | :--- | :--- | :--- |
+| **UDP :9001** | **`DISCOVER`** | `DISCOVER_IEC_SERVER` | Server lắng nghe UDP Broadcast và lấy IPv4 LAN thực tế để phản hồi | `IEC_SERVER_HERE\|<IP>\|9000` |
+| **TCP :9000** | **`LOGIN`** | `LOGIN\|<Id>\|<Name>\|<Dept>\|<Task>` | `SADD`, `HSET` hồ sơ, `SETEX` TTL 15s, đọc `LRANGE` gửi lại 3 tin nhắn gần nhất | `LOGIN_OK\|...` + `REPLAY\|...` |
+| **TCP :9000** | **`PING`** | `PING\|<Id>\|<TickMs>\|<RttMs>` | `EXPIRE` gia hạn TTL lên 15s, `HSET` lưu `RttMs`, `ZINCRBY` cộng 5s Uptime | `PONG\|<TickMs>` |
+| **TCP :9000** | **`STATUS`** | `STATUS\|<Id>\|<Online/Busy/Away>` | `SETEX staff:online:<Id> 15 "<Status>"`, cập nhật `LastSeen` | `STATUS_OK\|...` |
+| **TCP :9000** | **`TASK`** | `TASK\|<Id>\|<Mô_tả_công_việc>` | `HSET staff:profile:<Id> CurrentTask "<Task>"`, lưu nhật ký vào `LIST` | `TASK_OK\|...` |
+| **TCP :9000** | **`CHAT` / `DM`** | `CHAT\|<Id>\|<Msg>` hoặc `DM\|<From>\|<To>\|<Msg>` | `LPUSH` vào Redis `LIST`, định tuyến Broadcast (All) hoặc Unicast (riêng người nhận) | `BROADCAST\|...` / `DM_OK` |
+| **TCP :9000** | **`LOGOUT`** | `LOGOUT\|<Id>` | `DEL staff:online:<Id>` (chuyển sang `OFFLINE` tức thì không chờ 15s), đóng Socket | `BYE` |
+
+---
+
+## 5. Hướng dẫn Cài đặt & Chạy Kiểm thử (Windows & macOS)
+
+### Bước 1: Mở Terminal 1 — Khởi chạy Admin Server, UDP Responder & Web Cockpit
 ```bash
 git clone [https://github.com/bitmap1701/iec.git](https://github.com/bitmap1701/iec.git)
 cd iec
 dotnet run
 ```
 - Nhập **`1`** -> Nhấn **Enter** để chọn vai trò `ADMIN SERVER`.
-- Nhấn **Enter** ở dòng hỏi địa chỉ Redis (mặc định `localhost:6379`; nếu máy chưa bật Redis, hệ thống tự động bật `In-Memory Redis Engine`).
-- Trình duyệt sẽ tự động mở trang quản trị tại **`http://localhost:5050`**.
+- Nhấn **Enter** ở dòng hỏi địa chỉ Redis (mặc định `localhost:6379`; tự động kích hoạt `In-Memory 5-Struct Redis Engine` nếu máy chưa cài Redis).
+- Trình duyệt tự động mở trang quản trị tại **`http://localhost:5050`**.
 
-### Bước 2: Mở Terminal 2 — Khởi chạy thêm Employee Client trên dòng lệnh
-Giữ nguyên cửa sổ Terminal 1 đang chạy Server, mở một tab Terminal mới:
+### Bước 2: Mở Terminal 2 — Khởi chạy thêm Employee Client (Hỗ trợ UDP Auto-Discovery)
+Giữ nguyên cửa sổ Terminal 1 đang chạy Server, mở một tab Terminal mới (hoặc chạy trên một laptop thứ 2 trong cùng mạng LAN/Hotspot):
 ```bash
 cd iec
 dotnet run
 ```
 - Nhập **`2`** -> Nhấn **Enter** để chọn vai trò `EMPLOYEE CLIENT`.
-- Nhập IP Server: Nhấn **Enter** nếu chạy trên cùng máy (`127.0.0.1`), hoặc nhập IP LAN của máy chạy Server nếu test giữa 2 máy tính.
-- Nhập Mã NV (VD: `NV04`), Họ tên và Phòng ban -> Quan sát `NV04` xuất hiện ngay trên bảng `http://localhost:5050`.
+- Ở dòng hỏi IP Server: Nhấn **Enter** để Client tự động bắn gói tin **UDP Broadcast cổng `9001`** tìm IP của Server và kết nối TCP vào cổng `9000`.
+- Nhập Mã NV (`NV04`), Họ tên, Phòng ban và Task đang làm -> Quan sát `NV04` xuất hiện ngay trên bảng `http://localhost:5050`.
+
+---
+
+## 6. Năm Kịch bản Kiểm thử Nghiệm thu Đồ án
+
+1. **Kịch bản 1 — Tự động dò tìm Server bằng UDP (`UDP Broadcast -> TCP Handshake`):** Chạy Client `[2]` và nhấn Enter ở ô nhập IP -> Quan sát log `[UDP-9001]` trên Server trả lời địa chỉ IP LAN và Client tự động bắt tay TCP.
+2. **Kịch bản 2 — Rớt mạng / Sập nguồn đột ngột (`Half-Open Socket & Redis TTL 15s`):** Chọn một nhân viên trên Web Cockpit, bấm nút **"A. Giả lập Sập nguồn / Rớt mạng (Đóng Socket)"** -> Quan sát thanh `REDIS TTL (15s)` đếm ngược từ `15s` về `0s` rồi tự động chuyển sang **`OFFLINE`**.
+3. **Kịch bản 3 — Chống tấn công Spam gói tin (`TCP Flood & Redis Rate-Limiter`):** Bấm nút **"B. Giả lập Tấn công Spam 30 gói (Rate-Limit)"** -> Bộ đếm Redis phát hiện vượt ngưỡng 25 gói/10s, lập tức ngắt Socket và đổi nhãn sang **`BLOCKED (30s)`**.
+4. **Kịch bản 4 — Báo cáo Task (`Redis HASH`) & Xếp hạng Chuyên cần (`Redis ZSET`):** Cập nhật tiến độ công việc tại mục 2 bên phải và quan sát bảng tự động sắp xếp huy chương 🥇🥈🥉 theo điểm `UPTIME (ZSET)` tăng thêm 5 giây mỗi nhịp `PING`.
+5. **Kịch bản 5 — Chat nội bộ, Nhắn riêng (`Unicast DM`) & Phát lại lịch sử (`Redis LIST Replay`):** Gửi tin nhắn chung (`ALL`) hoặc nhắn riêng (`NV02`), sau đó mở một Client mới đăng nhập vào sẽ nhận được ngay 3 tin nhắn gần nhất nhờ cơ chế `REPLAY` từ Redis `LIST`.
+
+---
+
+## 7. Thành viên Thực hiện (Contributors)
+
+- **Huỳnh Nhật Hoà** ([@bitmap1701](https://github.com/bitmap1701)) — Kiến trúc sư hệ thống TCP/UDP Socket, tích hợp 5 cấu trúc Redis, Rate-Limiter & giao diện Web Cockpit.
+- **Lương Nhật Khôi** ([@FirstKhoi](https://github.com/FirstKhoi)) — Kiểm thử đa nền tảng (macOS Client <-> Windows Server), chuẩn hóa tài liệu kỹ thuật & kịch bản nghiệm thu.

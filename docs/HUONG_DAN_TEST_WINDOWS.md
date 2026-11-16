@@ -213,4 +213,4 @@ Bài nào không đạt: chép lại vài dòng cuối trong khung "Nhật ký g
 | Chữ tiếng Việt thành ký tự lạ trong terminal | Dùng Windows Terminal thay cho `cmd` |
 | Trình duyệt không tự mở | Tự mở `http://localhost:5050` |
 | Máy khác không nối vào được | Windows Security → Firewall → Allow an app → cho phép `iec` trên Private networks |
-| Dashboard còn nhân viên của lần test trước | `docker exec iec-redis redis-cli FLUSHALL` rồi tải lại trang |
+| Dashboard còn nhân viên của lần test trước | Chọn nhân viên rồi bấm **Xóa nhân viên khỏi Redis**. Muốn xóa sạch tất cả: `docker exec iec-redis redis-cli FLUSHALL` rồi tải lại trang |

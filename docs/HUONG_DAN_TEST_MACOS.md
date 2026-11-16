@@ -224,5 +224,5 @@ Bài nào không đạt: chép lại vài dòng cuối trong khung "Nhật ký g
 | `command not found: dotnet` | Chưa có dòng `export PATH=…` trong `~/.zshrc`, hoặc chưa mở terminal mới |
 | `[LỖI REDIS] Không kết nối được Redis` | `brew services start redis` |
 | `[LỖI CỔNG MẠNG] Cổng TCP 9000 đang được sử dụng` | Còn một server cũ đang chạy; tắt nó, hoặc nhập cổng khác |
-| Dashboard còn nhân viên của lần test trước | `redis-cli FLUSHALL` rồi tải lại trang |
+| Dashboard còn nhân viên của lần test trước | Chọn nhân viên rồi bấm **Xóa nhân viên khỏi Redis**. Muốn xóa sạch tất cả: `redis-cli FLUSHALL` rồi tải lại trang |
 | Client tự dò không ra server ở máy khác | Kiểm tra cùng Wi-Fi, cho phép tường lửa, hoặc gõ IP bằng tay |

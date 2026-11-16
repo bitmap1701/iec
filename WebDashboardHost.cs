@@ -274,6 +274,16 @@ namespace iec
                     {
                         await LogoutRealTcpAsync(empId);
                     }
+                    else if (action == "remove")
+                    {
+                        CloseSimClient(empId);
+                        _tcpServer.KickSession(empId);
+                        // shortcut: chờ handler của socket vừa đóng dọn xong rồi mới xóa khóa. Nhân viên đang nối vào
+                        // một Server IEC khác không bị ngắt, và sẽ hiện lại ở lần LOGIN kế tiếp.
+                        await Task.Delay(300);
+                        await _redisService.RemoveStaffAsync(empId);
+                        _tcpServer.AddCustomLog("ADMIN", $"Đã xóa {empId} khỏi Redis (SREM, ZREM, DEL hồ sơ và các khóa trạng thái)");
+                    }
                     else if (action == "broadcast")
                     {
                         await _tcpServer.BroadcastMessageAsync(root.GetProperty("message").GetString());
@@ -448,6 +458,7 @@ namespace iec
             <button class="block danger" onclick="act('flood')"><span>B. Spam 30 dòng lệnh</span><small>Khóa 30s</small></button>
             <button class="block" onclick="act('logout')"><span>C. Đăng xuất chuẩn (LOGOUT)</span><small>Offline ngay</small></button>
             <button class="block" onclick="reconnect()"><span>Kết nối lại TCP</span><small>LOGIN</small></button>
+            <button class="block danger" onclick="removeStaff()"><span>Xóa nhân viên khỏi Redis</span><small>Ngắt socket + xóa khóa</small></button>
           </div>
         </div>
 
@@ -551,6 +562,9 @@ namespace iec
   function reconnect() {
     const cur = staff.find(s => s.EmpId === selectedId);
     if (cur) apiAction({ action:'connect', empId:cur.EmpId, fullName:cur.FullName, dept:cur.Department });
+  }
+  function removeStaff() {
+    if (selectedId && confirm(`Xóa ${selectedId} khỏi Redis? Nhân viên này sẽ bị ngắt kết nối.`)) act('remove');
   }
   function addStaff() {
     const id = $('newId').value.trim().toUpperCase();

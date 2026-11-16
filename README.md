@@ -84,7 +84,7 @@ Client dùng địa chỉ nguồn của gói trả lời làm IP server và lấ
 | `PING` | `PING\|<Id>\|<Mốc>[\|<RttMs>]` | Trả `PONG` trước, sau đó `EXPIRE 15`, `HSET`, `ZINCRBY 5` | `PONG\|<Mốc>` |
 | `STATUS` | `STATUS\|<Id>\|<Online/Busy/Away>` | `SET staff:online:<Id> … EX 15` | `STATUS_OK\|…` |
 | `CHAT` | `CHAT\|<Id>\|<Nội dung>` | `LPUSH` + `PUBLISH`, mọi server đẩy xuống socket của mình | `BROADCAST\|[CHAT TỪ <Id>]: …` tới mọi người |
-| `DM` | `DM\|<Từ>\|<Tới>\|<Nội dung>` | `LPUSH` + `PUBLISH`, chỉ socket của `<Tới>` nhận | `DM_OK\|…` nếu người nhận đang online, ngược lại `DM_QUEUED\|…` |
+| `DM` | `DM\|<Từ>\|<Tới>\|<Nội dung>` | `LPUSH` + `PUBLISH`, chỉ socket của `<Tới>` nhận | `DM_OK\|…` nếu người nhận đang online, `DM_QUEUED\|…` nếu đang offline |
 | `LOGOUT` | `LOGOUT\|<Id>` | `DEL staff:online:<Id>`, đóng socket | `BYE` |
 
 Ghi chú:
@@ -100,6 +100,7 @@ Ghi chú:
 | `ERR\|NOT_LOGGED_IN\|…` | Gửi lệnh khác `LOGIN` khi chưa đăng nhập, hoặc `LOGIN` sai cú pháp | Đóng kết nối |
 | `ERR\|ID_MISMATCH\|…` | Sau khi đăng nhập, gửi lệnh với `<Id>` khác mã của kết nối | Giữ kết nối, bỏ qua lệnh |
 | `ERR\|RATE_LIMIT_BLOCKED\|…` | Quá 25 dòng lệnh trong 10 giây | Đóng kết nối, khóa mã NV 30 giây |
+| `ERR\|UNKNOWN_USER\|…` | `DM` tới mã nhân viên chưa từng đăng nhập | Giữ kết nối, không lưu tin |
 | `ERR\|BAD_COMMAND\|…` | Lệnh không tồn tại hoặc thiếu tham số | Giữ kết nối |
 
 Server cũng đóng kết nối khi một dòng dài quá 4096 ký tự hoặc khi 15 giây không nhận được dòng nào.
@@ -159,6 +160,8 @@ Trên cùng một máy, chỉ server khởi động trước giữ được cổ
 ---
 
 ## 6. Kịch bản demo
+
+Tra nhanh quy trình, lệnh trên hai hệ điều hành và các con số chuẩn: [Bảng sử dụng](docs/BANG_SU_DUNG.md).
 
 Hướng dẫn chạy thử từng bước kèm kết quả mong đợi: [macOS](docs/HUONG_DAN_TEST_MACOS.md) · [Windows](docs/HUONG_DAN_TEST_WINDOWS.md).
 

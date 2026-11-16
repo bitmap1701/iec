@@ -117,6 +117,22 @@ namespace iec
             await _db.HashSetAsync($"{ProfilePrefix}{empId}", "LastSeen", DateTime.Now.ToString("HH:mm:ss"));
         }
 
+        // Xóa mọi khóa của một nhân viên. Lịch sử chat giữ nguyên vì là nhật ký chung.
+        public async Task RemoveStaffAsync(string empId)
+        {
+            await _db.SetRemoveAsync(StaffSetKey, empId);
+            await _db.SortedSetRemoveAsync(UptimeZSetKey, empId);
+            await _db.KeyDeleteAsync(new RedisKey[]
+            {
+                $"{ProfilePrefix}{empId}", $"{OnlinePrefix}{empId}", $"{RateLimitPrefix}{empId}", $"{BlockedPrefix}{empId}"
+            });
+            _pingCounters.TryRemove(empId, out _);
+            _lastBroadcasts.TryRemove(empId, out _);
+        }
+
+        // Mã NV đã từng đăng nhập (có trong SET staff:ids) thì mới là người nhận hợp lệ
+        public Task<bool> IsKnownStaffAsync(string empId) => _db.SetContainsAsync(StaffSetKey, empId);
+
         public Task<bool> IsOnlineAsync(string empId) => _db.KeyExistsAsync($"{OnlinePrefix}{empId}");
 
         // Lưu tin vào LIST (để REPLAY) rồi PUBLISH lên kênh: mọi Server IEC đang SUBSCRIBE sẽ tự đẩy tin

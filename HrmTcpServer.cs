@@ -67,6 +67,12 @@ namespace iec
         public bool IsClientSocketActive(string empId) =>
             _activeSessions.TryGetValue(empId, out var s) && s.Client.Connected;
 
+        // Đóng socket của một nhân viên đang nối vào Server này (dùng khi Admin xóa nhân viên)
+        public void KickSession(string empId)
+        {
+            if (_activeSessions.TryGetValue(empId, out var s)) s.Client.Close();
+        }
+
         public List<TcpLogEntry> GetRecentLogs() => _tcpLogs.ToArray().Reverse().Take(70).ToList();
 
         public void ClearLogs() => _tcpLogs.Clear();
@@ -325,6 +331,14 @@ namespace iec
                     {
                         string toId = HrmProtocol.Sanitize(parts[2], "NV01").ToUpperInvariant();
                         string msg = HrmProtocol.Sanitize(parts[3], "");
+
+                        // Chỉ xếp hàng tin cho người có thật: mã lạ thì báo lỗi ngay, không lưu vào lịch sử
+                        if (!await _redisService.IsKnownStaffAsync(toId))
+                        {
+                            AddCustomLog("DM", $"{empId} nhắn riêng tới mã không tồn tại \"{toId}\" -> từ chối");
+                            await session.SafeWriteLineAsync($"ERR|UNKNOWN_USER|Không có nhân viên nào mang mã {toId}.");
+                            continue;
+                        }
 
                         await _redisService.PublishChatAsync(empId, toId, msg);
                         AddCustomLog("DM", $"LPUSH + PUBLISH {empId} -> {toId}: \"{msg}\"");

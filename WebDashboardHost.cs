@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
@@ -78,7 +78,7 @@ namespace iec
             {
                 await Task.Delay(400, token);
                 await ConnectRealTcpClientAsync("NV01", "Huỳnh Nhật Hoà", "Core .NET", "HRM-1: TCP/UDP Socket Engine (95%)");
-                await ConnectRealTcpClientAsync("NV02", "Lương Nhật Khôi", "macOS QA", "HRM-2: Kiểm thử macOS & README (90%)");
+                await ConnectRealTcpClientAsync("NV02", "Lương Nhất Khôi", "macOS QA", "HRM-2: Kiểm thử macOS & README (90%)");
                 await ConnectRealTcpClientAsync("NV03", "Trần Minh Tuấn", "SecOps", "HRM-4: Redis Rate-Limit & ZSET (80%)");
                 await SendStatusRealTcpAsync("NV03", "Busy");
                 await _redisService.AppendChatMessageAsync("NV01", "ALL", "Hệ thống TCP Socket + 5 cấu trúc Redis đã sẵn sàng!");

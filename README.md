@@ -145,4 +145,4 @@ dotnet run
 ## 7. Thành viên Thực hiện (Contributors)
 
 - **Huỳnh Nhật Hoà** ([@bitmap1701](https://github.com/bitmap1701)) — Kiến trúc sư hệ thống TCP/UDP Socket, tích hợp 5 cấu trúc Redis, Rate-Limiter & giao diện Web Cockpit.
-- **Lương Nhật Khôi** ([@FirstKhoi](https://github.com/FirstKhoi)) — Kiểm thử đa nền tảng (macOS Client <-> Windows Server), chuẩn hóa tài liệu kỹ thuật & kịch bản nghiệm thu.
+- **Lương Nhất Khôi** ([@FirstKhoi](https://github.com/FirstKhoi)) — Kiểm thử đa nền tảng (macOS Client <-> Windows Server), chuẩn hóa tài liệu kỹ thuật & kịch bản nghiệm thu.

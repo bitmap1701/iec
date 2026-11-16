@@ -13,7 +13,7 @@ namespace iec
     public class HrmTcpClient
     {
         private string _serverIp;
-        private readonly int _serverPort;
+        private int _serverPort;
         private TcpClient _client;
         private StreamReader _reader;
         private StreamWriter _writer;
@@ -30,7 +30,7 @@ namespace iec
         }
 
         // Dùng giao thức UDP Broadcast (Port 9001) để tự động tìm IP của Admin Server trong mạng LAN
-        public static async Task<string> DiscoverServerViaUdpAsync(int timeoutMs = 1800)
+        public static async Task<IPEndPoint> DiscoverServerViaUdpAsync(int timeoutMs = 1800)
         {
             try
             {
@@ -44,7 +44,12 @@ namespace iec
                 string text = Encoding.UTF8.GetString(res.Buffer).Trim();
                 // Lấy IP từ địa chỉ nguồn của gói trả lời (do tầng mạng ghi), không tin IP server tự khai trong payload
                 if (text.StartsWith(HrmProtocol.UdpDiscoverResponse))
-                    return res.RemoteEndPoint.Address.ToString();
+                {
+                    // Cổng TCP thì chỉ Server biết (mỗi Server IEC có thể mở cổng khác nhau) nên lấy từ payload
+                    string[] parts = text.Split('|');
+                    int port = parts.Length >= 3 && int.TryParse(parts[2], out int p) ? p : HrmProtocol.DefaultPort;
+                    return new IPEndPoint(res.RemoteEndPoint.Address, port);
+                }
             }
             catch (OperationCanceledException) { }
             catch (SocketException ex)
@@ -78,9 +83,11 @@ namespace iec
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.WriteLine($"[UDP DISCOVERY] Đang phát gói tin UDP Broadcast tới cổng {HrmProtocol.UdpDiscoveryPort} để tìm Server...");
-                _serverIp = await DiscoverServerViaUdpAsync();
-                if (_serverIp != null)
+                var found = await DiscoverServerViaUdpAsync();
+                if (found != null)
                 {
+                    _serverIp = found.Address.ToString();
+                    _serverPort = found.Port;
                     Console.WriteLine($"[UDP DISCOVERY] Đã tìm thấy Admin Server tại địa chỉ: {_serverIp}:{_serverPort}");
                     Console.ResetColor();
                 }
@@ -118,7 +125,7 @@ namespace iec
                 await SafeSendLineAsync($"{HrmProtocol.CmdLogin}|{_empId}|{fullName}|{dept}");
 
                 using var cts = new CancellationTokenSource();
-                _ = Task.Run(() => ListenServerAsync(cts.Token));
+                _ = Task.Run(() => ListenServerAsync(cts));
                 _ = Task.Run(() => HeartbeatLoopAsync(cts.Token));
 
                 await EmployeeMenuLoopAsync(cts);
@@ -147,8 +154,9 @@ namespace iec
             catch { }
         }
 
-        private async Task ListenServerAsync(CancellationToken token)
+        private async Task ListenServerAsync(CancellationTokenSource cts)
         {
+            CancellationToken token = cts.Token;
             try
             {
                 string line;
@@ -200,8 +208,9 @@ namespace iec
                 if (!token.IsCancellationRequested)
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("\n[CẢNH BÁO] Đã mất kết nối TCP với Server!");
+                    Console.WriteLine("\n[CẢNH BÁO] Đã mất kết nối TCP với Server! Nhấn Enter để thoát.");
                     Console.ResetColor();
+                    cts.Cancel(); // dừng nhịp tim và vòng menu: socket đã chết thì không còn gì để gửi
                 }
             }
         }
@@ -219,6 +228,7 @@ namespace iec
                 Console.Write("Chọn thao tác: ");
 
                 string choice = Console.ReadLine()?.Trim();
+                if (choice == null || cts.IsCancellationRequested) break; // stdin đã đóng, hoặc mất kết nối trong lúc chờ nhập
                 if (choice == "1") await SafeSendLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Online");
                 else if (choice == "2") await SafeSendLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Busy");
                 else if (choice == "3") await SafeSendLineAsync($"{HrmProtocol.CmdStatus}|{_empId}|Away");

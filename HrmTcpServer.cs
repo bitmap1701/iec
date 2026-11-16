@@ -24,15 +24,19 @@ namespace iec
             Writer = writer;
         }
 
-        public async Task SafeWriteLineAsync(string line)
+        // Trả false thay vì ném lỗi: socket hỏng của người nhận không được làm sập handler của người gửi
+        public async Task<bool> SafeWriteLineAsync(string line)
         {
             await _writeLock.WaitAsync();
             try
             {
-                if (Client.Connected)
-                {
-                    await Writer.WriteLineAsync(line);
-                }
+                if (!Client.Connected) return false;
+                await Writer.WriteLineAsync(line);
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+            {
+                return false;
             }
             finally
             {
@@ -57,6 +61,8 @@ namespace iec
             _redisService = redisService;
             _port = port;
         }
+
+        public int Port => _port;
 
         public bool IsClientSocketActive(string empId) =>
             _activeSessions.TryGetValue(empId, out var s) && s.Client.Connected;
@@ -85,6 +91,7 @@ namespace iec
                 string lanIp = GetLocalLanIp();
                 AddCustomLog("SERVER", $"TcpListener started on {lanIp}:{_port} | UDP Discovery on :{HrmProtocol.UdpDiscoveryPort}");
 
+                _redisService.SubscribeChat(DeliverChatToLocalSocketsAsync);
                 _ = Task.Run(() => AcceptClientsLoopAsync(token), token);
                 _ = Task.Run(() => StartUdpDiscoveryResponderAsync(token), token);
                 return true;
@@ -118,6 +125,11 @@ namespace iec
                         AddCustomLog("UDP-9001", $"RECV UDP Broadcast from {result.RemoteEndPoint.Address} -> REPLY: {reply}");
                     }
                 }
+            }
+            catch (SocketException ex)
+            {
+                // Thường gặp khi chạy Server thứ hai trên cùng máy: cổng UDP đã thuộc về Server đầu tiên
+                AddCustomLog("UDP-9001", $"Không mở được cổng UDP Discovery: {ex.Message}");
             }
             catch { }
         }
@@ -180,9 +192,27 @@ namespace iec
             }
         }
 
+        // StreamReader.ReadLineAsync không giới hạn độ dài: một client gửi mãi không xuống dòng sẽ ăn hết RAM server.
+        // Trả null khi EOF.
+        private static async Task<string> ReadLineLimitedAsync(StreamReader reader, CancellationToken token)
+        {
+            var sb = new StringBuilder();
+            var buf = new char[1];
+            while (true)
+            {
+                int n = await reader.ReadAsync(buf.AsMemory(), token);
+                if (n == 0) return sb.Length > 0 ? sb.ToString() : null;
+                if (buf[0] == '\n') return sb.ToString();
+                if (sb.Length >= HrmProtocol.MaxLineLength)
+                    throw new InvalidDataException($"Dòng vượt quá {HrmProtocol.MaxLineLength} ký tự");
+                sb.Append(buf[0]);
+            }
+        }
+
         private async Task HandleClientAsync(TcpClient client)
         {
             string currentEmpId = null;
+            ClientSession session = null;
             string clientEndpoint = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "127.0.0.1";
 
             try
@@ -192,131 +222,142 @@ namespace iec
                 using StreamReader reader = new(stream, utf8NoBom);
                 using StreamWriter writer = new(stream, utf8NoBom) { AutoFlush = true };
 
-                var session = new ClientSession(client, writer);
+                session = new ClientSession(client, writer);
 
-                string line;
-                while ((line = await reader.ReadLineAsync()) != null)
+                while (true)
                 {
-                    line = line.Trim('\uFEFF', '\r', '\n');
+                    // Client mất mạng/sập nguồn không gửi được FIN: socket vẫn "mở" nhưng im lặng mãi (half-open).
+                    // Hạn đọc = TTL: quá 3 nhịp tim không có dòng nào thì server tự đóng.
+                    using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(HrmProtocol.OnlineTtlSeconds));
+                    string line = await ReadLineLimitedAsync(reader, readCts.Token);
+                    if (line == null)
+                    {
+                        AddCustomLog("DROP", $"Socket {currentEmpId ?? clientEndpoint} đóng (EOF) không qua LOGOUT -> Offline ngay");
+                        break;
+                    }
+
+                    line = line.Trim('﻿', '\r', '\n');
                     if (string.IsNullOrWhiteSpace(line)) continue;
 
                     string[] parts = line.Split('|');
                     string cmd = parts[0].ToUpperInvariant();
-                    string candidateId = parts.Length >= 2 ? HrmProtocol.Sanitize(parts[1], "NV01").ToUpperInvariant() : (currentEmpId ?? "UNKNOWN");
+                    string claimedId = parts.Length >= 2 ? HrmProtocol.Sanitize(parts[1], "").ToUpperInvariant() : "";
 
-                    // Kiểm tra tường lửa chống Spam gói tin (Redis Sliding/Fixed Window Rate-Limiter)
-                    var rateCheck = await _redisService.CheckAndIncrementRateLimitAsync(candidateId);
-                    if (!rateCheck.Allowed)
+                    if (currentEmpId == null && (cmd != HrmProtocol.CmdLogin || parts.Length < 4 || claimedId is "" or "ALL" or "ADMIN"))
                     {
-                        AddCustomLog("SECOPS", $"[RATE-LIMIT BLOCKED] {candidateId} vượt quá {HrmProtocol.MaxPacketsPerWindow} gói/10s! Khóa Socket {rateCheck.BlockedSecondsLeft}s.");
-                        await session.SafeWriteLineAsync($"ERR|RATE_LIMIT_BLOCKED|Tài khoản {candidateId} bị khóa {rateCheck.BlockedSecondsLeft}s do gửi spam gói tin TCP!");
+                        AddCustomLog("SECOPS", $"{clientEndpoint} gửi {cmd} khi chưa LOGIN -> đóng Socket");
+                        await session.SafeWriteLineAsync("ERR|NOT_LOGGED_IN|Phải gửi LOGIN|<Id>|<Name>|<Dept> trước khi dùng lệnh khác.");
                         break;
                     }
 
-                    if (cmd == HrmProtocol.CmdLogin && parts.Length >= 4)
+                    // Mã NV gắn với kết nối từ lúc LOGIN; trước đó chỉ có mã client tự khai trong dòng LOGIN
+                    string empId = currentEmpId ?? claimedId;
+
+                    // Kiểm tra tường lửa chống Spam gói tin (Redis Fixed Window Rate-Limiter)
+                    var rateCheck = await _redisService.CheckAndIncrementRateLimitAsync(empId);
+                    if (!rateCheck.Allowed)
                     {
-                        currentEmpId = candidateId;
+                        AddCustomLog("SECOPS", $"[RATE-LIMIT BLOCKED] {empId} vượt quá {HrmProtocol.MaxPacketsPerWindow} gói/10s! Khóa Socket {rateCheck.BlockedSecondsLeft}s.");
+                        await session.SafeWriteLineAsync($"ERR|RATE_LIMIT_BLOCKED|Tài khoản {empId} bị khóa {rateCheck.BlockedSecondsLeft}s do gửi spam gói tin TCP!");
+                        break;
+                    }
+
+                    // Không tin mã NV client tự khai ở các dòng sau LOGIN: chặn gửi thay người khác
+                    if (currentEmpId != null && (cmd == HrmProtocol.CmdLogin || claimedId != currentEmpId))
+                    {
+                        AddCustomLog("SECOPS", $"{currentEmpId} gửi \"{cmd}|{claimedId}\" sai mã phiên -> từ chối");
+                        await session.SafeWriteLineAsync($"ERR|ID_MISMATCH|Kết nối này đã đăng nhập là {currentEmpId}.");
+                        continue;
+                    }
+
+                    if (cmd == HrmProtocol.CmdLogin)
+                    {
+                        currentEmpId = empId;
                         string fullName = HrmProtocol.Sanitize(parts[2], "Nhân viên");
                         string dept = HrmProtocol.Sanitize(parts[3], "IT");
-                        string task = parts.Length >= 5 ? HrmProtocol.Sanitize(parts[4], "Đang trực ca") : "Đang trực ca";
 
-                        _activeSessions[currentEmpId] = session;
-                        await _redisService.RegisterLoginAsync(currentEmpId, fullName, dept, clientEndpoint, task);
+                        // Đăng nhập lại cùng mã: đóng socket phiên cũ để nó không còn gửi được dưới mã này
+                        _activeSessions.AddOrUpdate(empId, session, (_, old) => { old.Client.Close(); return session; });
+                        await _redisService.RegisterLoginAsync(empId, fullName, dept, clientEndpoint);
 
-                        AddCustomLog("LOGIN", $"RECV: {line} -> SADD, HSET & SETEX staff:online:{currentEmpId} 15s");
-                        await session.SafeWriteLineAsync($"LOGIN_OK|Đăng nhập thành công mã {currentEmpId}. TTL Redis = {HrmProtocol.OnlineTtlSeconds}s");
+                        AddCustomLog("LOGIN", $"RECV: {line} -> SADD, HSET & SETEX staff:online:{empId} 15s");
+                        await session.SafeWriteLineAsync($"LOGIN_OK|Đăng nhập thành công mã {empId}. TTL Redis = {HrmProtocol.OnlineTtlSeconds}s");
 
-                        // Phát lại 3 tin nhắn gần nhất từ Redis LIST (Offline Message Replay)
-                        var recentChats = await _redisService.GetRecentChatHistoryAsync(3);
-                        recentChats.Reverse();
+                        // Phát lại 3 tin gần nhất mà người này được phép thấy: tin chung, hoặc DM gửi/nhận của chính họ
+                        var recentChats = (await _redisService.GetRecentChatHistoryAsync(50))
+                            .Where(c => c.Target == "ALL" || c.Target == empId || c.Sender == empId)
+                            .Take(3).Reverse();
                         foreach (var c in recentChats)
                         {
                             await session.SafeWriteLineAsync($"REPLAY|[{c.Time}] {c.Sender} -> {c.Target}: {c.Content}");
                         }
                     }
-                    else if (cmd == HrmProtocol.CmdPing && parts.Length >= 2)
+                    else if (cmd == HrmProtocol.CmdPing)
                     {
-                        string empId = candidateId;
-                        currentEmpId ??= empId;
-                        _activeSessions[empId] = session;
+                        // Trường 3 là dấu thời gian riêng của client, Server chỉ gửi trả nguyên văn để client tự tính RTT
+                        string echo = parts.Length >= 3 ? HrmProtocol.Sanitize(parts[2], "0") : "0";
+                        double? clientRtt = parts.Length >= 4 && double.TryParse(parts[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double r) ? r : null;
+                        string rttText = clientRtt.HasValue ? $"{clientRtt:0.00}ms" : "chưa đo";
 
-                        long sentTick = parts.Length >= 3 && long.TryParse(parts[2], out long t) ? t : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                        double clientMeasuredRtt = parts.Length >= 4 && double.TryParse(parts[3], out double r) ? r : 1.1;
-
-                        await _redisService.RefreshHeartbeatAsync(empId, clientEndpoint, clientMeasuredRtt);
-                        AddCustomLog("PING", $"RECV: PING|{empId} (RTT {clientMeasuredRtt:0.0}ms) -> EXPIRE 15s & ZINCRBY +5s");
+                        // Trả PONG trước khi gọi Redis để RTT client đo được là độ trễ mạng, không lẫn thời gian xử lý
+                        await session.SafeWriteLineAsync($"PONG|{echo}");
+                        await _redisService.RefreshHeartbeatAsync(empId, clientRtt);
+                        AddCustomLog("PING", $"RECV: PING|{empId} (RTT {rttText}) -> EXPIRE 15s & ZINCRBY +5s");
                         if (_showPingLogs)
                         {
-                            LogConsole($"[PING] {empId} (RTT {clientMeasuredRtt:0.0}ms) -> Gia hạn TTL 15s", ConsoleColor.DarkGray);
+                            LogConsole($"[PING] {empId} (RTT {rttText}) -> Gia hạn TTL 15s", ConsoleColor.DarkGray);
                         }
-                        await session.SafeWriteLineAsync($"PONG|{sentTick}");
                     }
                     else if (cmd == HrmProtocol.CmdStatus && parts.Length >= 3)
                     {
-                        string empId = candidateId;
                         string newStatus = HrmProtocol.Sanitize(parts[2], "Online");
-                        currentEmpId ??= empId;
-                        _activeSessions[empId] = session;
-
                         await _redisService.UpdateStatusAsync(empId, newStatus);
                         AddCustomLog("STATUS", $"RECV: {line} -> SETEX staff:online:{empId} 15 \"{newStatus}\"");
                         await session.SafeWriteLineAsync($"STATUS_OK|Đã cập nhật trạng thái trên Redis: {newStatus}");
                     }
-                    else if (cmd == HrmProtocol.CmdTask && parts.Length >= 3)
-                    {
-                        string empId = candidateId;
-                        string taskInfo = HrmProtocol.Sanitize(parts[2], "Đang trực ca");
-                        await _redisService.UpdateTaskAsync(empId, taskInfo);
-                        await _redisService.AppendChatMessageAsync(empId, "TASK-BOARD", $"Cập nhật công việc: {taskInfo}");
-                        AddCustomLog("TASK", $"RECV: {line} -> HSET staff:profile:{empId} CurrentTask=\"{taskInfo}\"");
-                        await session.SafeWriteLineAsync($"TASK_OK|Đã lưu tiến độ công việc vào Redis Hash: {taskInfo}");
-                    }
                     else if (cmd == HrmProtocol.CmdChat && parts.Length >= 3)
                     {
-                        string empId = candidateId;
                         string msg = HrmProtocol.Sanitize(parts[2], "");
-                        await _redisService.AppendChatMessageAsync(empId, "ALL", msg);
-                        AddCustomLog("CHAT", $"LPUSH staff:chat:history \"{empId}: {msg}\" & Broadcast to {_activeSessions.Count} sockets");
-
-                        foreach (var kvp in _activeSessions)
-                        {
-                            await kvp.Value.SafeWriteLineAsync($"BROADCAST|[CHAT TỪ {empId}]: {msg}");
-                            _redisService.RecordBroadcastForStaff(kvp.Key, $"{empId}: {msg}");
-                        }
+                        await _redisService.PublishChatAsync(empId, "ALL", msg);
+                        AddCustomLog("CHAT", $"LPUSH + PUBLISH \"{empId}: {msg}\"");
                     }
                     else if (cmd == HrmProtocol.CmdDm && parts.Length >= 4)
                     {
-                        string fromId = candidateId;
                         string toId = HrmProtocol.Sanitize(parts[2], "NV01").ToUpperInvariant();
                         string msg = HrmProtocol.Sanitize(parts[3], "");
 
-                        await _redisService.AppendChatMessageAsync(fromId, toId, $"[DM] {msg}");
-                        AddCustomLog("DM", $"UNICAST {fromId} -> {toId}: \"{msg}\" (Saved to Redis LIST)");
+                        await _redisService.PublishChatAsync(empId, toId, msg);
+                        AddCustomLog("DM", $"LPUSH + PUBLISH {empId} -> {toId}: \"{msg}\"");
 
-                        if (_activeSessions.TryGetValue(toId, out var targetSession))
-                        {
-                            await targetSession.SafeWriteLineAsync($"BROADCAST|[TIN NHẮN RIÊNG TỪ {fromId}]: {msg}");
-                            _redisService.RecordBroadcastForStaff(toId, $"[DM từ {fromId}]: {msg}");
-                            await session.SafeWriteLineAsync($"DM_OK|Đã chuyển phát tin nhắn riêng tới Socket của {toId}.");
-                        }
+                        // Người nhận có thể đang nối vào một Server IEC khác, nên hỏi Redis chứ không tra bảng socket cục bộ
+                        if (await _redisService.IsOnlineAsync(toId))
+                            await session.SafeWriteLineAsync($"DM_OK|Đã chuyển tin nhắn riêng tới {toId}.");
                         else
-                        {
                             await session.SafeWriteLineAsync($"DM_QUEUED|{toId} hiện Offline. Tin nhắn đã lưu vào Redis LIST để phát lại khi {toId} đăng nhập.");
-                        }
                     }
-                    else if (cmd == HrmProtocol.CmdLogout && parts.Length >= 2)
+                    else if (cmd == HrmProtocol.CmdLogout)
                     {
-                        string empId = candidateId;
-                        await _redisService.SetOfflineImmediatelyAsync(empId);
                         AddCustomLog("LOGOUT", $"RECV: {line} -> DEL staff:online:{empId} (Offline ngay lập tức)");
                         await session.SafeWriteLineAsync("BYE");
                         break;
                     }
+                    else
+                    {
+                        await session.SafeWriteLineAsync($"ERR|BAD_COMMAND|Lệnh không hợp lệ hoặc thiếu tham số: {cmd}");
+                    }
                 }
             }
-            catch (IOException)
+            catch (OperationCanceledException)
             {
-                AddCustomLog("DROP", $"Socket {currentEmpId ?? clientEndpoint} ngắt đột ngột! Chờ Redis TTL 15s tự hủy khóa...");
+                AddCustomLog("DROP", $"[HALF-OPEN] {currentEmpId ?? clientEndpoint} im lặng quá {HrmProtocol.OnlineTtlSeconds}s (không FIN/RST) -> Server chủ động đóng Socket");
+            }
+            catch (InvalidDataException ex)
+            {
+                AddCustomLog("SECOPS", $"{currentEmpId ?? clientEndpoint}: {ex.Message} -> đóng Socket");
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+            {
+                AddCustomLog("DROP", $"Socket {currentEmpId ?? clientEndpoint} ngắt đột ngột (RST, hoặc bị phiên đăng nhập mới cùng mã thay thế)");
             }
             catch (Exception ex)
             {
@@ -324,31 +365,43 @@ namespace iec
             }
             finally
             {
-                if (!string.IsNullOrEmpty(currentEmpId))
+                // Chỉ dọn khi bảng phiên vẫn trỏ tới chính kết nối này; nếu cùng mã NV đã đăng nhập lại
+                // trên socket mới thì không được xóa phiên mới hay đặt nó Offline.
+                if (currentEmpId != null &&
+                    _activeSessions.TryRemove(new KeyValuePair<string, ClientSession>(currentEmpId, session)))
                 {
-                    _activeSessions.TryRemove(currentEmpId, out _);
+                    try { await _redisService.SetOfflineImmediatelyAsync(currentEmpId); } catch { }
                 }
                 client.Close();
             }
         }
 
-        public async Task<int> BroadcastMessageAsync(string message)
+        public async Task BroadcastMessageAsync(string message)
         {
             string cleanMsg = HrmProtocol.Sanitize(message, "Thông báo");
-            await _redisService.AppendChatMessageAsync("ADMIN", "ALL", cleanMsg);
-            int count = 0;
+            await _redisService.PublishChatAsync("ADMIN", "ALL", cleanMsg);
+            AddCustomLog("BROADCAST", $"LPUSH + PUBLISH thông báo Admin: \"{cleanMsg}\"");
+        }
+
+        // Chạy mỗi khi Redis đẩy một tin từ kênh Pub/Sub về (kể cả tin do chính Server này PUBLISH):
+        // chuyển tiếp xuống các socket đang nối vào Server này.
+        private async Task DeliverChatToLocalSocketsAsync(ChatMessageEntry m)
+        {
+            string text = m.Sender == "ADMIN" ? $"[THÔNG BÁO TỪ ADMIN]: {m.Content}"
+                        : m.Target == "ALL" ? $"[CHAT TỪ {m.Sender}]: {m.Content}"
+                        : $"[TIN NHẮN RIÊNG TỪ {m.Sender}]: {m.Content}";
+
+            int sent = 0;
             foreach (var kvp in _activeSessions)
             {
-                try
+                if (m.Target != "ALL" && kvp.Key != m.Target) continue;
+                if (await kvp.Value.SafeWriteLineAsync($"BROADCAST|{text}"))
                 {
-                    await kvp.Value.SafeWriteLineAsync($"BROADCAST|[THÔNG BÁO TỪ ADMIN]: {cleanMsg}");
-                    _redisService.RecordBroadcastForStaff(kvp.Key, cleanMsg);
-                    count++;
+                    _redisService.RecordBroadcastForStaff(kvp.Key, text);
+                    sent++;
                 }
-                catch { }
             }
-            AddCustomLog("BROADCAST", $"SEND to {count} sockets & LPUSH Redis LIST: \"{cleanMsg}\"");
-            return count;
+            AddCustomLog("PUBSUB", $"RECV từ Redis: {m.Sender} -> {m.Target} | đẩy xuống {sent} socket của Server :{_port}");
         }
 
         private async Task AdminDashboardLoopAsync(CancellationTokenSource cts)
@@ -356,26 +409,20 @@ namespace iec
             while (!cts.IsCancellationRequested)
             {
                 Console.WriteLine("\n================ BẢNG ĐIỀU KHIỂN ADMIN (CONSOLE + WEB UI) ================");
-                Console.WriteLine($" -> Giao diện Web Cockpit: http://localhost:{HrmProtocol.WebUiPort} | IP LAN: {GetLocalLanIp()}:{_port}");
-                Console.WriteLine(" [1] Xem bảng Nhân viên & Xếp hạng Uptime (Redis ZSET) trên Console");
-                Console.WriteLine(" [2] Gửi thông báo Broadcast tới toàn bộ Nhân viên đang Online");
-                Console.WriteLine($" [3] Bật/Tắt log PING trên Console (Hiện tại: {(_showPingLogs ? "BẬT" : "TẮT")})");
+                Console.WriteLine($" -> Giao diện Web Cockpit: http://localhost:{HrmProtocol.WebPortFor(_port)} | IP LAN: {GetLocalLanIp()}:{_port}");
+                Console.WriteLine(" [1] Gửi thông báo Broadcast tới toàn bộ Nhân viên đang Online");
+                Console.WriteLine($" [2] Bật/Tắt log PING trên Console (Hiện tại: {(_showPingLogs ? "BẬT" : "TẮT")})");
                 Console.WriteLine(" [0] Dừng Server và Thoát");
                 Console.Write("Chọn thao tác Admin: ");
 
                 string choice = Console.ReadLine()?.Trim();
                 if (choice == "1")
                 {
-                    await PrintStaffTableAsync();
+                    Console.Write("Nhập nội dung thông báo gửi toàn công ty: ");
+                    await BroadcastMessageAsync(Console.ReadLine());
+                    Console.WriteLine("-> Đã PUBLISH lên Redis và lưu vào Redis LIST.");
                 }
                 else if (choice == "2")
-                {
-                    Console.Write("Nhập nội dung thông báo gửi toàn công ty: ");
-                    string msg = Console.ReadLine();
-                    int sent = await BroadcastMessageAsync(msg);
-                    Console.WriteLine($"-> Đã gửi tới {sent} nhân viên và lưu vào Redis LIST.");
-                }
-                else if (choice == "3")
                 {
                     _showPingLogs = !_showPingLogs;
                 }
@@ -387,22 +434,6 @@ namespace iec
                     break;
                 }
             }
-        }
-
-        private async Task PrintStaffTableAsync()
-        {
-            var list = await _redisService.GetAllStaffPresenceAsync(IsClientSocketActive);
-            Console.WriteLine("\n----------------------------------------------------------------------------------------------------------------------------");
-            Console.WriteLine($"{"MÃ NV",-7} | {"HỌ VÀ TÊN",-18} | {"TRẠNG THÁI",-10} | {"TTL",-6} | {"RTT",-7} | {"UPTIME (ZSET)",-13} | {"TASK ĐANG LÀM (REDIS HASH)",-26}");
-            Console.WriteLine("----------------------------------------------------------------------------------------------------------------------------");
-            foreach (var s in list)
-            {
-                Console.ForegroundColor = s.IsRateLimited ? ConsoleColor.Red : (s.IsOnline ? ConsoleColor.Green : ConsoleColor.DarkGray);
-                string ttlText = s.IsOnline ? $"{s.RemainingTtlSeconds}s" : "0s";
-                Console.WriteLine($"{s.EmpId,-7} | {s.FullName,-18} | {s.CurrentStatus,-10} | {ttlText,-6} | {s.RttMs + "ms",-7} | {s.UptimeSeconds + "s",-13} | {s.CurrentTask,-26}");
-                Console.ResetColor();
-            }
-            Console.WriteLine("----------------------------------------------------------------------------------------------------------------------------");
         }
 
         private void LogConsole(string message, ConsoleColor color)

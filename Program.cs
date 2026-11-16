@@ -28,46 +28,54 @@ namespace iec
                 string redisConn = Console.ReadLine()?.Trim();
                 if (string.IsNullOrEmpty(redisConn)) redisConn = "localhost:6379";
 
-                var redisService = new RedisPresenceService(redisConn);
-                await redisService.CheckConnectionAsync();
+                // Chạy nhiều Server IEC dùng chung một Redis: mỗi Server một cổng TCP riêng
+                Console.Write($"Nhập cổng TCP của Server này (Nhấn Enter để dùng {HrmProtocol.DefaultPort}): ");
+                if (!int.TryParse(Console.ReadLine()?.Trim(), out int tcpPort)) tcpPort = HrmProtocol.DefaultPort;
 
-                if (redisService.IsUsingFallbackMemory)
+                RedisPresenceService redisService;
+                try
                 {
-                    Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.WriteLine($"[CHẾ ĐỘ GIẢ LẬP REDIS] Chưa phát hiện Redis Server tại '{redisConn}'.");
-                    Console.WriteLine("-> Đã kích hoạt In-Memory 5-Struct Redis Engine (SET, HASH, TTL, ZSET, LIST + RateLimit)!");
-                    Console.ResetColor();
+                    redisService = new RedisPresenceService(redisConn);
                 }
-                else
+                catch (StackExchange.Redis.RedisConnectionException)
                 {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"[REDIS OK] Đã kết nối thành công tới Redis Server thật ({redisConn}).");
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[LỖI REDIS] Không kết nối được Redis tại '{redisConn}'.");
+                    Console.WriteLine("-> Hãy bật Redis trước (macOS: brew services start redis | Docker: docker run -p 6379:6379 redis).");
                     Console.ResetColor();
+                    return;
                 }
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[REDIS OK] Đã kết nối tới Redis Server ({redisConn}).");
+                Console.ResetColor();
 
                 using var cts = new CancellationTokenSource();
-                var server = new HrmTcpServer(redisService, HrmProtocol.DefaultPort);
+                var server = new HrmTcpServer(redisService, tcpPort);
                 if (!server.StartBackgroundListener(cts.Token))
                 {
                     return;
                 }
 
-                var webUi = new WebDashboardHost(redisService, server, HrmProtocol.WebUiPort);
+                var webUi = new WebDashboardHost(redisService, server, HrmProtocol.WebPortFor(tcpPort));
                 await webUi.StartAsync(cts.Token);
-
-                Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine($"[WEB UI READY] Đã mở giao diện quản trị tại: http://localhost:{HrmProtocol.WebUiPort}");
-                Console.ResetColor();
 
                 await server.RunAsync(cts);
             }
             else
             {
-                Console.Write("Nhập IP của Admin Server (Nhấn Enter để tự động dò tìm qua UDP Broadcast cổng 9001): ");
+                Console.Write("Nhập IP[:cổng] của Admin Server (Nhấn Enter để tự động dò tìm qua UDP Broadcast cổng 9001): ");
                 string serverIp = Console.ReadLine()?.Trim();
                 if (string.IsNullOrEmpty(serverIp)) serverIp = "AUTO";
 
-                var client = new HrmTcpClient(serverIp, HrmProtocol.DefaultPort);
+                int port = HrmProtocol.DefaultPort;
+                int colon = serverIp.LastIndexOf(':');
+                if (colon > 0 && int.TryParse(serverIp[(colon + 1)..], out int p))
+                {
+                    port = p;
+                    serverIp = serverIp[..colon];
+                }
+
+                var client = new HrmTcpClient(serverIp, port);
                 await client.StartClientInteractiveAsync();
             }
         }

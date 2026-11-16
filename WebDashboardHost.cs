@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -12,18 +13,16 @@ using System.Threading.Tasks;
 
 namespace iec
 {
+    // Một TcpClient thật do Web Cockpit điều khiển: mọi nút bấm trên web đều đi qua NetworkStream tới cổng TCP của Server
     public class ManagedSimClient
     {
-        public string EmpId { get; set; }
-        public string FullName { get; set; }
-        public string Department { get; set; }
-        public string CurrentTask { get; set; }
         public TcpClient Client { get; set; }
         public StreamWriter Writer { get; set; }
         public CancellationTokenSource Cts { get; set; }
-        public double LastRttMs { get; set; } = 1.2;
+        public double? LastRttMs { get; set; }
         private readonly SemaphoreSlim _writeLock = new(1, 1);
-        public bool IsConnected => Client != null && Client.Connected;
+        // Cts bị hủy = client đã "chết" (bị đóng hoặc giả lập rớt mạng): không được gửi thêm gì nữa
+        public bool IsConnected => Client != null && Client.Connected && Cts?.IsCancellationRequested != true;
 
         public async Task SafeSendAsync(string payload)
         {
@@ -74,52 +73,35 @@ namespace iec
                 return Task.CompletedTask;
             }
 
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(400, token);
-                await ConnectRealTcpClientAsync("NV01", "Huỳnh Nhật Hoà", "Core .NET", "HRM-1: TCP/UDP Socket Engine (95%)");
-                await ConnectRealTcpClientAsync("NV02", "Lương Nhật Khôi", "macOS QA", "HRM-2: Kiểm thử macOS & README (90%)");
-                await ConnectRealTcpClientAsync("NV03", "Trần Minh Tuấn", "SecOps", "HRM-4: Redis Rate-Limit & ZSET (80%)");
-                await SendStatusRealTcpAsync("NV03", "Busy");
-                await _redisService.AppendChatMessageAsync("NV01", "ALL", "Hệ thống TCP Socket + 5 cấu trúc Redis đã sẵn sàng!");
-            }, token);
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"[WEB UI READY] Đã mở giao diện quản trị tại: http://localhost:{_httpPort}");
+            Console.ResetColor();
 
             OpenBrowser($"http://localhost:{_httpPort}");
             _ = Task.Run(() => HandleHttpRequestsLoopAsync(token), token);
             return Task.CompletedTask;
         }
 
-        public async Task ConnectRealTcpClientAsync(string empId, string fullName, string dept, string task = "Đang trực ca")
+        public async Task ConnectRealTcpClientAsync(string empId, string fullName, string dept)
         {
             empId = HrmProtocol.Sanitize(empId, "NV01").ToUpperInvariant();
             fullName = HrmProtocol.Sanitize(fullName, "Nhân viên");
             dept = HrmProtocol.Sanitize(dept, "IT");
-            task = HrmProtocol.Sanitize(task, "Đang trực ca");
 
-            await KillSocketWithoutLogoutAsync(empId);
+            CloseSimClient(empId);
 
             var tcp = new TcpClient();
-            await tcp.ConnectAsync("127.0.0.1", HrmProtocol.DefaultPort);
+            await tcp.ConnectAsync("127.0.0.1", _tcpServer.Port);
             var stream = tcp.GetStream();
             var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
             var reader = new StreamReader(stream, utf8NoBom);
             var writer = new StreamWriter(stream, utf8NoBom) { AutoFlush = true };
             var cts = new CancellationTokenSource();
 
-            var sim = new ManagedSimClient
-            {
-                EmpId = empId,
-                FullName = fullName,
-                Department = dept,
-                CurrentTask = task,
-                Client = tcp,
-                Writer = writer,
-                Cts = cts,
-                LastRttMs = Math.Round(0.8 + new Random().NextDouble() * 1.4, 1)
-            };
+            var sim = new ManagedSimClient { Client = tcp, Writer = writer, Cts = cts };
             _simClients[empId] = sim;
 
-            await sim.SafeSendAsync($"{HrmProtocol.CmdLogin}|{empId}|{fullName}|{dept}|{task}");
+            await sim.SafeSendAsync($"{HrmProtocol.CmdLogin}|{empId}|{fullName}|{dept}");
 
             _ = Task.Run(async () =>
             {
@@ -128,20 +110,14 @@ namespace iec
                     string line;
                     while (!cts.Token.IsCancellationRequested && (line = await reader.ReadLineAsync()) != null)
                     {
-                        line = line.Trim('\uFEFF', '\r', '\n');
+                        line = line.Trim('﻿', '\r', '\n');
                         if (line.StartsWith("PONG|"))
                         {
                             string[] p = line.Split('|');
                             if (p.Length >= 2 && long.TryParse(p[1], out long sentTick))
                             {
-                                double diff = Math.Max(0.6, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - sentTick);
-                                sim.LastRttMs = Math.Round(diff, 1);
+                                sim.LastRttMs = Stopwatch.GetElapsedTime(sentTick).TotalMilliseconds;
                             }
-                        }
-                        else if (line.StartsWith("BROADCAST|"))
-                        {
-                            string msg = line.Substring("BROADCAST|".Length);
-                            _redisService.RecordBroadcastForStaff(empId, msg);
                         }
                         else if (line.StartsWith("ERR|RATE_LIMIT_BLOCKED"))
                         {
@@ -161,85 +137,50 @@ namespace iec
                     using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(HrmProtocol.HeartbeatIntervalMs));
                     while (await timer.WaitForNextTickAsync(cts.Token))
                     {
-                        long tick = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                        await sim.SafeSendAsync($"{HrmProtocol.CmdPing}|{empId}|{tick}|{sim.LastRttMs:0.0}");
+                        string rtt = sim.LastRttMs.HasValue ? "|" + sim.LastRttMs.Value.ToString("0.00", CultureInfo.InvariantCulture) : "";
+                        await sim.SafeSendAsync($"{HrmProtocol.CmdPing}|{empId}|{Stopwatch.GetTimestamp()}{rtt}");
                     }
                 }
                 catch { }
             }, cts.Token);
         }
 
-        public async Task SendStatusRealTcpAsync(string empId, string status)
+        private async Task SendIfConnectedAsync(string empId, string payload)
         {
             if (_simClients.TryGetValue(empId, out var sim) && sim.IsConnected)
             {
-                await sim.SafeSendAsync($"{HrmProtocol.CmdStatus}|{empId}|{status}");
+                await sim.SafeSendAsync(payload);
             }
         }
 
-        public async Task SendTaskRealTcpAsync(string empId, string taskDesc)
+        public Task SendChatOrDmRealTcpAsync(string fromId, string targetId, string message)
         {
-            if (_simClients.TryGetValue(empId, out var sim) && sim.IsConnected)
-            {
-                sim.CurrentTask = taskDesc;
-                await sim.SafeSendAsync($"{HrmProtocol.CmdTask}|{empId}|{taskDesc}");
-            }
-            else
-            {
-                await _redisService.UpdateTaskAsync(empId, taskDesc);
-            }
+            message = HrmProtocol.Sanitize(message, "");
+            targetId = HrmProtocol.Sanitize(targetId, "ALL").ToUpperInvariant();
+            if (message == "") return Task.CompletedTask;
+            return SendIfConnectedAsync(fromId, targetId == "ALL"
+                ? $"{HrmProtocol.CmdChat}|{fromId}|{message}"
+                : $"{HrmProtocol.CmdDm}|{fromId}|{targetId}|{message}");
         }
 
-        public async Task SendChatOrDmRealTcpAsync(string fromId, string targetId, string message)
-        {
-            if (_simClients.TryGetValue(fromId, out var sim) && sim.IsConnected)
-            {
-                if (string.IsNullOrWhiteSpace(targetId) || targetId == "ALL")
-                    await sim.SafeSendAsync($"{HrmProtocol.CmdChat}|{fromId}|{message}");
-                else
-                    await sim.SafeSendAsync($"{HrmProtocol.CmdDm}|{fromId}|{targetId}|{message}");
-            }
-            else
-            {
-                await _redisService.AppendChatMessageAsync(fromId, targetId ?? "ALL", message);
-            }
-        }
-
-        // Bắn 30 gói tin liên tiếp trên Socket thật để kích hoạt tường lửa Redis Rate-Limiter
+        // Bắn 30 dòng lệnh liên tiếp trên Socket thật để kích hoạt Redis Rate-Limiter.
+        // Dùng STATUS thay vì PING để đợt spam không cộng điểm uptime.
         public async Task TriggerFloodAttackRealTcpAsync(string empId)
         {
-            if (_simClients.TryGetValue(empId, out var sim) && sim.IsConnected)
+            for (int i = 0; i < 30; i++)
             {
-                for (int i = 0; i < 30; i++)
-                {
-                    await sim.SafeSendAsync($"{HrmProtocol.CmdPing}|{empId}|{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}|0.5");
-                }
+                await SendIfConnectedAsync(empId, $"{HrmProtocol.CmdStatus}|{empId}|Online");
             }
         }
 
         public async Task LogoutRealTcpAsync(string empId)
         {
-            if (_simClients.TryRemove(empId, out var sim))
-            {
-                try
-                {
-                    if (sim.IsConnected)
-                    {
-                        await sim.SafeSendAsync($"{HrmProtocol.CmdLogout}|{empId}");
-                        await Task.Delay(150);
-                    }
-                    sim.Cts.Cancel();
-                    sim.Client.Close();
-                }
-                catch { }
-            }
-            else
-            {
-                await _redisService.SetOfflineImmediatelyAsync(empId);
-            }
+            await SendIfConnectedAsync(empId, $"{HrmProtocol.CmdLogout}|{empId}");
+            await Task.Delay(150);
+            CloseSimClient(empId);
         }
 
-        public Task KillSocketWithoutLogoutAsync(string empId)
+        private void CloseSimClient(string empId)
         {
             if (_simClients.TryRemove(empId, out var sim))
             {
@@ -250,7 +191,13 @@ namespace iec
                 }
                 catch { }
             }
-            return Task.CompletedTask;
+        }
+
+        // Giả lập mất mạng/sập nguồn thật: ngừng gửi PING nhưng KHÔNG đóng socket (không có FIN/RST),
+        // nên Server chỉ phát hiện được nhờ hạn đọc 15s.
+        public void FreezeSocketWithoutClose(string empId)
+        {
+            if (_simClients.TryGetValue(empId, out var sim)) sim.Cts.Cancel();
         }
 
         private async Task HandleHttpRequestsLoopAsync(CancellationToken token)
@@ -279,8 +226,8 @@ namespace iec
                     var chats = await _redisService.GetRecentChatHistoryAsync(25);
                     var payload = new
                     {
-                        redisMode = _redisService.IsUsingFallbackMemory ? "In-Memory 5-Struct Redis Engine" : "Redis Server 6379 (Live)",
-                        lanIp = $"{HrmTcpServer.GetLocalLanIp()}:{HrmProtocol.DefaultPort}",
+                        redis = _redisService.Endpoint,
+                        lanIp = $"{HrmTcpServer.GetLocalLanIp()}:{_tcpServer.Port}",
                         staff,
                         chats,
                         logs = _tcpServer.GetRecentLogs()
@@ -296,48 +243,36 @@ namespace iec
                     using var doc = JsonDocument.Parse(body);
                     var root = doc.RootElement;
                     string action = root.GetProperty("action").GetString();
+                    string empId = root.TryGetProperty("empId", out var idProp) ? idProp.GetString() : null;
 
                     if (action == "connect")
                     {
-                        string task = root.TryGetProperty("task", out var tProp) ? tProp.GetString() : "Đang trực ca";
-                        await ConnectRealTcpClientAsync(
-                            root.GetProperty("empId").GetString(),
+                        await ConnectRealTcpClientAsync(empId,
                             root.GetProperty("fullName").GetString(),
-                            root.GetProperty("dept").GetString(),
-                            task);
+                            root.GetProperty("dept").GetString());
                     }
                     else if (action == "status")
                     {
-                        await SendStatusRealTcpAsync(
-                            root.GetProperty("empId").GetString(),
-                            root.GetProperty("status").GetString());
-                    }
-                    else if (action == "task")
-                    {
-                        await SendTaskRealTcpAsync(
-                            root.GetProperty("empId").GetString(),
-                            root.GetProperty("task").GetString());
+                        await SendIfConnectedAsync(empId, $"{HrmProtocol.CmdStatus}|{empId}|{HrmProtocol.Sanitize(root.GetProperty("status").GetString(), "Online")}");
                     }
                     else if (action == "chat")
                     {
-                        await SendChatOrDmRealTcpAsync(
-                            root.GetProperty("empId").GetString(),
+                        await SendChatOrDmRealTcpAsync(empId,
                             root.GetProperty("target").GetString(),
                             root.GetProperty("message").GetString());
                     }
                     else if (action == "flood")
                     {
-                        await TriggerFloodAttackRealTcpAsync(root.GetProperty("empId").GetString());
+                        await TriggerFloodAttackRealTcpAsync(empId);
                     }
                     else if (action == "kill")
                     {
-                        string id = root.GetProperty("empId").GetString();
-                        await KillSocketWithoutLogoutAsync(id);
-                        _tcpServer.AddCustomLog("DROP", $"[KILL SOCKET] Đã ngắt ngang TcpClient của {id}. Đang đếm ngược Redis TTL 15s...");
+                        FreezeSocketWithoutClose(empId);
+                        _tcpServer.AddCustomLog("DROP", $"[HALF-OPEN] {empId} ngừng gửi PING nhưng socket không đóng. Chờ hạn đọc {HrmProtocol.OnlineTtlSeconds}s của Server...");
                     }
                     else if (action == "logout")
                     {
-                        await LogoutRealTcpAsync(root.GetProperty("empId").GetString());
+                        await LogoutRealTcpAsync(empId);
                     }
                     else if (action == "broadcast")
                     {
@@ -354,7 +289,7 @@ namespace iec
                 }
                 else
                 {
-                    byte[] htmlBytes = Encoding.UTF8.GetBytes(GetDashboardHtml());
+                    byte[] htmlBytes = Encoding.UTF8.GetBytes(DashboardHtml);
                     resp.ContentType = "text/html; charset=utf-8";
                     await resp.OutputStream.WriteAsync(htmlBytes);
                 }
@@ -385,338 +320,253 @@ namespace iec
             catch { }
         }
 
-        private string GetDashboardHtml() => @"<!DOCTYPE html>
-<html lang='vi' class='dark'>
+        // Không tải gì từ Internet (CSS/font tự viết) để demo được trong mạng LAN không có Internet.
+        // Mọi chuỗi do client gửi lên đều đi qua esc() trước khi chèn vào trang.
+        private const string DashboardHtml = """
+<!DOCTYPE html>
+<html lang="vi">
 <head>
-  <meta charset='UTF-8'>
-  <title>IEC Enterprise — TCP/UDP Socket & 5-Structure Redis Cockpit</title>
-  <script src='https://cdn.tailwindcss.com'></script>
-  <link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap' rel='stylesheet'>
-  <style>
-    body { font-family: 'Inter', sans-serif; background-color: #090d16; color: #f1f5f9; }
-    .mono { font-family: 'JetBrains Mono', monospace; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IEC Cockpit</title>
+<style>
+  :root { color-scheme:dark; --bg:#0b1018; --panel:#131b27; --line:#243044; --text:#e6edf5; --dim:#8a99ad;
+          --ok:#34d399; --warn:#fbbf24; --info:#38bdf8; --bad:#fb7185; --accent:#818cf8; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--text);
+         font:13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .mono, code, td.id, .log, .kpi b { font-family:ui-monospace, "SF Mono", Consolas, monospace; }
+  h1 { font-size:16px; margin:0; } h2 { font-size:12px; margin:0; color:var(--dim); text-transform:uppercase; letter-spacing:.05em; }
+  header, .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; }
+  header { padding:12px 16px; display:flex; flex-wrap:wrap; gap:8px 24px; justify-content:space-between; align-items:center; }
+  header .dim { color:var(--dim); font-size:12px; } header code { color:var(--ok); }
+  main { display:grid; grid-template-columns:minmax(0,2fr) minmax(280px,1fr); gap:16px; margin-top:16px; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  .col { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  .panel { overflow:hidden; } .panel > h2 { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; }
+  .pad { padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
+  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  .kpi { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; color:var(--dim); font-size:12px; }
+  .kpi b { display:block; font-size:22px; color:var(--text); }
+  table { width:100%; border-collapse:collapse; } .scroll { overflow-x:auto; }
+  th { text-align:left; font-size:11px; color:var(--dim); font-weight:600; padding:8px 12px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  td { padding:8px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  tbody tr { cursor:pointer; } tbody tr:hover { background:#1a2433; } tbody tr.sel { background:#1d2540; }
+  td.id { color:var(--info); font-weight:600; } td .sub { color:var(--dim); font-size:11px; } td.num { text-align:right; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11px; border:1px solid currentColor; white-space:nowrap; }
+  .on { color:var(--ok); } .busy { color:var(--warn); } .away { color:var(--info); } .off { color:var(--dim); } .blocked { color:var(--bad); font-weight:700; }
+  .ttl { display:flex; align-items:center; gap:8px; min-width:110px; }
+  .bar { flex:1; height:6px; background:var(--line); border-radius:3px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--ok); transition:width .3s; } .bar i.low { background:var(--bad); }
+  .log { height:220px; overflow-y:auto; padding:10px 14px; font-size:11px; background:#080c13; }
+  .log div { margin-bottom:4px; overflow-wrap:anywhere; } .log .t { color:var(--dim); } .log .tag { font-weight:600; color:var(--info); }
+  .tag.PING { color:var(--ok); } .tag.DROP, .tag.ERROR, .tag.SECOPS { color:var(--bad); }
+  .tag.BROADCAST, .tag.STATUS { color:var(--warn); } .tag.PUBSUB, .tag.CHAT, .tag.DM, .tag.UDP-9001 { color:var(--accent); }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:900px) { .two { grid-template-columns:1fr; } }
+  input, select, button { font:inherit; color:var(--text); background:#0b1018; border:1px solid var(--line); border-radius:6px; padding:6px 10px; min-width:0; }
+  input:focus, select:focus, button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  button { cursor:pointer; background:#1b2637; font-weight:600; } button:hover { background:#243247; }
+  button.primary { background:#4f46e5; border-color:#4f46e5; } button.primary:hover { background:#6366f1; }
+  button.danger { color:var(--bad); } button.block { width:100%; text-align:left; display:flex; justify-content:space-between; gap:8px; }
+  button.block small { color:var(--dim); font-weight:400; }
+  .row { display:flex; gap:8px; } .row > input { flex:1; } .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  label { color:var(--dim); font-size:11px; display:block; margin-bottom:4px; }
+  dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:4px 12px; font-size:12px; } dt { color:var(--dim); } dd { margin:0; text-align:right; overflow-wrap:anywhere; }
+  .empty { color:var(--dim); padding:16px; text-align:center; }
+</style>
 </head>
-<body class='min-h-screen flex flex-col p-4 gap-4'>
-  <header class='bg-[#111827] border border-slate-800 rounded-xl px-5 py-3 flex flex-wrap items-center justify-between gap-4'>
-    <div class='flex items-center gap-3'>
-      <span class='w-3 h-3 rounded-full bg-emerald-400 animate-ping'></span>
-      <div>
-        <div class='flex items-center gap-2 flex-wrap'>
-          <h1 class='font-bold text-base text-white'>IEC Distributed Presence &amp; Telemetry</h1>
-          <span class='text-[11px] mono px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'>TCP :9000 + UDP :9001</span>
-          <span id='redisModeBadge' class='text-[11px] mono px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/30'>Redis 5-Struct</span>
-        </div>
-        <p class='text-xs text-slate-400'>Đồ án Lập trình mạng (IEC_CNTT) • Redis SET + HASH + STRING TTL + ZSET Leaderboard + LIST Replay + Rate-Limiter</p>
+<body>
+<header>
+  <div>
+    <h1>IEC Presence Cockpit</h1>
+    <div class="dim">Lập trình mạng — TCP Socket, UDP Discovery và Redis (TTL, Pub/Sub, Rate-Limiter)</div>
+  </div>
+  <div class="dim">Server TCP <code id="lanIp">-</code> · Redis <code id="redis">-</code> · Giới hạn 25 dòng lệnh/10s</div>
+</header>
+
+<main>
+  <div class="col">
+    <div class="kpis">
+      <div class="kpi">Nhân sự (SET)<b id="kpiTotal">0</b></div>
+      <div class="kpi">Online (TTL 15s)<b id="kpiOnline" class="on">0</b></div>
+      <div class="kpi">Bị khóa spam<b id="kpiBlocked" class="blocked">0</b></div>
+      <div class="kpi">Tin đã lưu (LIST)<b id="kpiChats">0</b></div>
+    </div>
+
+    <div class="panel"><div class="pad"><div class="row">
+      <input id="broadcastInput" placeholder="Thông báo Admin gửi tới mọi nhân viên (PUBLISH lên Redis)…" aria-label="Nội dung thông báo Admin">
+      <button class="primary" onclick="sendBroadcast()">Phát thông báo</button>
+    </div></div></div>
+
+    <div class="panel">
+      <h2><span>Nhân sự</span><span>Xếp theo uptime (ZSET)</span></h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Mã NV</th><th>Họ tên · Phòng · IP</th><th>Trạng thái</th><th>TTL khóa online</th><th>RTT</th><th style="text-align:right">Uptime</th></tr></thead>
+        <tbody id="staffBody"></tbody>
+      </table></div>
+      <div id="staffEmpty" class="empty">Chưa có nhân viên nào. Thêm một kết nối ở khung bên phải, hoặc chạy client console (chọn [2]).</div>
+    </div>
+
+    <div class="two">
+      <div class="panel">
+        <h2><span>Nhật ký gói tin</span><button onclick="apiAction({action:'clear_logs'})">Xóa</button></h2>
+        <div id="logBox" class="log"></div>
+      </div>
+      <div class="panel">
+        <h2><span>Lịch sử chat (Redis LIST)</span><span>50 tin gần nhất</span></h2>
+        <div id="chatBox" class="log"></div>
       </div>
     </div>
-    <div class='text-xs mono text-slate-300 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800'>
-      LAN Server: <span id='lanIpBadge' class='text-emerald-400 font-semibold'>0.0.0.0:9000</span> | UDP Auto-Discovery: <span class='text-cyan-400'>:9001</span> | Rate-Limit: <span class='text-amber-400'>25 pkt/10s</span>
+  </div>
+
+  <div class="col">
+    <div class="panel">
+      <h2><span>Điều khiển TcpClient</span><span id="sockBadge" class="badge off">-</span></h2>
+      <div class="pad">
+        <div><label for="empSelect">Nhân viên đang chọn</label><select id="empSelect" style="width:100%" onchange="selectedId=this.value; render()"></select></div>
+        <dl class="mono">
+          <dt>Khóa Redis</dt><dd id="simKey">-</dd>
+          <dt>Số PING · RTT</dt><dd id="simPings">-</dd>
+          <dt>Tin nhận cuối</dt><dd id="simLast">-</dd>
+        </dl>
+
+        <div><label>Đổi trạng thái (STATUS)</label><div class="grid3">
+          <button class="on" onclick="act('status',{status:'Online'})">Online</button>
+          <button class="busy" onclick="act('status',{status:'Busy'})">Busy</button>
+          <button class="away" onclick="act('status',{status:'Away'})">Away</button>
+        </div></div>
+
+        <div><label for="chatMessage">Chat chung hoặc nhắn riêng (CHAT / DM)</label><div class="row">
+          <input id="chatTarget" placeholder="ALL / NV02" style="flex:0 0 96px" aria-label="Người nhận">
+          <input id="chatMessage" placeholder="Nội dung…">
+          <button class="primary" onclick="sendChat()">Gửi</button>
+        </div></div>
+
+        <div><label>Kịch bản kiểm thử</label>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <button class="block danger" onclick="act('kill')"><span>A. Rớt mạng: im lặng, không FIN</span><small>Server ngắt sau 15s</small></button>
+            <button class="block danger" onclick="act('flood')"><span>B. Spam 30 dòng lệnh</span><small>Khóa 30s</small></button>
+            <button class="block" onclick="act('logout')"><span>C. Đăng xuất chuẩn (LOGOUT)</span><small>Offline ngay</small></button>
+            <button class="block" onclick="reconnect()"><span>Kết nối lại TCP</span><small>LOGIN</small></button>
+          </div>
+        </div>
+
+        <div><label>Mở kết nối nhân viên mới</label>
+          <div class="grid3" style="margin-bottom:8px">
+            <input id="newId" placeholder="NV01" aria-label="Mã nhân viên">
+            <input id="newName" placeholder="Họ tên" aria-label="Họ tên">
+            <input id="newDept" placeholder="Phòng" aria-label="Phòng ban">
+          </div>
+          <button style="width:100%" onclick="addStaff()">+ Mở TcpClient mới</button>
+        </div>
+      </div>
     </div>
-  </header>
+  </div>
+</main>
 
-  <main class='grid grid-cols-1 lg:grid-cols-12 gap-4 flex-1'>
-    <section class='lg:col-span-8 flex flex-col gap-4'>
-      <div class='grid grid-cols-4 gap-3'>
-        <div class='bg-[#111827] border border-slate-800 rounded-xl p-3'>
-          <span class='text-xs text-slate-400'>Tổng Nhân sự (Redis SET)</span>
-          <div id='kpiTotal' class='text-2xl font-bold mono mt-1'>0</div>
-        </div>
-        <div class='bg-[#111827] border border-emerald-900/50 rounded-xl p-3'>
-          <span class='text-xs text-emerald-400'>Online (STRING TTL 15s)</span>
-          <div id='kpiOnline' class='text-2xl font-bold mono text-emerald-400 mt-1'>0</div>
-        </div>
-        <div class='bg-[#111827] border border-rose-900/50 rounded-xl p-3'>
-          <span class='text-xs text-rose-400'>Khóa Spam (Rate-Limiter)</span>
-          <div id='kpiBlocked' class='text-2xl font-bold mono text-rose-400 mt-1'>0</div>
-        </div>
-        <div class='bg-[#111827] border border-indigo-900/50 rounded-xl p-3'>
-          <span class='text-xs text-indigo-400'>Tin nhắn Lưu (Redis LIST)</span>
-          <div id='kpiChats' class='text-2xl font-bold mono text-indigo-400 mt-1'>0</div>
-        </div>
-      </div>
+<script>
+  const $ = id => document.getElementById(id);
+  // Chữ do client gửi lên (tên, tin nhắn, log) là dữ liệu không tin cậy: luôn escape trước khi chèn vào HTML
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  let staff = [], chats = [], selectedId = '', lastOptions = '';
 
-      <div class='bg-[#111827] border border-slate-800 rounded-xl p-3 flex gap-2 items-center'>
-        <input id='broadcastInput' type='text' placeholder='Nhập thông báo Admin Broadcast gửi qua NetworkStream &amp; lưu vào Redis LIST...' class='flex-1 bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500'>
-        <button onclick='sendBroadcast()' class='bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold px-4 py-2 rounded-lg transition'>Phát TCP Broadcast</button>
-      </div>
+  async function apiAction(payload) {
+    await fetch('/api/action', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    await refresh();
+  }
+  function act(action, extra) { if (selectedId) apiAction({ action, empId:selectedId, ...extra }); }
 
-      <div class='bg-[#111827] border border-slate-800 rounded-xl overflow-hidden'>
-        <div class='px-4 py-2.5 border-b border-slate-800 flex justify-between items-center'>
-          <span class='text-xs font-semibold uppercase tracking-wider text-slate-300'>Bảng Giám sát Nhân sự, Tiến độ Công việc (HASH) &amp; Xếp hạng Chuyên cần (ZSET)</span>
-          <span class='text-[11px] mono text-cyan-400'>Sắp xếp theo điểm Redis ZSET Uptime</span>
-        </div>
-        <table class='w-full text-left border-collapse'>
-          <thead>
-            <tr class='border-b border-slate-800 text-[11px] mono text-slate-400 bg-slate-900/60'>
-              <th class='py-2.5 px-3'>MÃ NV</th>
-              <th class='py-2.5 px-3'>HỌ TÊN &amp; PHÒNG</th>
-              <th class='py-2.5 px-3'>TRẠNG THÁI</th>
-              <th class='py-2.5 px-3 w-36'>REDIS TTL (15s)</th>
-              <th class='py-2.5 px-3'>RTT</th>
-              <th class='py-2.5 px-3'>TASK ĐANG LÀM (HASH)</th>
-              <th class='py-2.5 px-3 text-right'>UPTIME (ZSET)</th>
-            </tr>
-          </thead>
-          <tbody id='staffBody' class='divide-y divide-slate-800/70 text-xs'></tbody>
-        </table>
-      </div>
+  async function refresh() {
+    try {
+      const d = await (await fetch('/api/state')).json();
+      $('redis').textContent = d.redis; $('lanIp').textContent = d.lanIp;
+      staff = d.staff || []; chats = d.chats || [];
+      render();
+      $('logBox').innerHTML = (d.logs || []).map(l =>
+        `<div><span class="t">${esc(l.Time)}</span> <span class="tag ${esc(l.Tag)}">[${esc(l.Tag)}]</span> ${esc(l.Message)}</div>`).join('');
+      $('chatBox').innerHTML = chats.map(c =>
+        `<div><span class="t">${esc(c.Time)}</span> <span class="tag">${esc(c.Sender)} → ${esc(c.Target)}:</span> ${esc(c.Content)}</div>`).join('');
+    } catch (e) {}
+  }
 
-      <div class='grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[210px]'>
-        <div class='bg-[#111827] border border-slate-800 rounded-xl flex flex-col overflow-hidden'>
-          <div class='px-3.5 py-2 border-b border-slate-800 bg-slate-900/60 flex justify-between items-center'>
-            <span class='text-xs font-semibold text-cyan-400 mono'>Nhật ký Gói tin TCP/UDP &amp; Lệnh Redis</span>
-            <button onclick='clearLogs()' class='text-[11px] text-slate-400 hover:text-white'>Xóa Log</button>
-          </div>
-          <div id='logBox' class='p-3 mono text-[11px] space-y-1.5 overflow-y-auto max-h-52 bg-[#070a12] flex-1'></div>
-        </div>
+  function badge(s) {
+    if (s.IsRateLimited) return `<span class="badge blocked">BLOCKED ${s.BlockedRemainingSeconds}s</span>`;
+    if (!s.IsOnline) return `<span class="badge off">Offline</span>`;
+    const cls = s.CurrentStatus === 'Online' ? 'on' : s.CurrentStatus === 'Busy' ? 'busy' : 'away';
+    return `<span class="badge ${cls}">● ${esc(s.CurrentStatus)}</span>`;
+  }
+  const rtt = s => s.IsOnline && s.RttMs != null ? s.RttMs.toFixed(2) + ' ms' : '-';
 
-        <div class='bg-[#111827] border border-slate-800 rounded-xl flex flex-col overflow-hidden'>
-          <div class='px-3.5 py-2 border-b border-slate-800 bg-slate-900/60 flex justify-between items-center'>
-            <span class='text-xs font-semibold text-indigo-400 mono'>Kênh Chat Nội bộ &amp; Replay (Redis LIST)</span>
-            <span class='text-[10px] mono text-slate-400'>LPUSH + LTRIM 50</span>
-          </div>
-          <div id='chatBox' class='p-3 mono text-[11px] space-y-1.5 overflow-y-auto max-h-52 bg-[#070a12] flex-1'></div>
-        </div>
-      </div>
-    </section>
+  function render() {
+    $('kpiTotal').textContent = staff.length;
+    $('kpiOnline').textContent = staff.filter(s => s.IsOnline).length;
+    $('kpiBlocked').textContent = staff.filter(s => s.IsRateLimited).length;
+    $('kpiChats').textContent = chats.length;
+    if (!staff.some(s => s.EmpId === selectedId)) selectedId = staff.length ? staff[0].EmpId : '';
 
-    <aside class='lg:col-span-4 flex flex-col gap-4'>
-      <div class='bg-[#111827] border border-indigo-500/30 rounded-xl p-4 flex flex-col gap-3'>
-        <div class='border-b border-slate-800 pb-2 flex justify-between items-center'>
-          <div>
-            <span class='text-[10px] mono uppercase px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300'>Real C# TcpClient Control</span>
-            <h2 class='text-sm font-bold text-white mt-1'>Trình Điều Khiển Nhân Viên</h2>
-          </div>
-          <span id='simSocketBadge' class='text-[11px] mono px-2 py-1 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'>ACTIVE</span>
-        </div>
+    // Chỉ dựng lại <select> khi danh sách đổi, để không đóng menu đang mở mỗi giây
+    const options = staff.map(s => `<option value="${esc(s.EmpId)}">${esc(s.EmpId)} — ${esc(s.FullName)}</option>`).join('');
+    if (options !== lastOptions) { $('empSelect').innerHTML = options; lastOptions = options; }
+    $('empSelect').value = selectedId;
 
-        <div>
-          <label class='text-[11px] text-slate-400 block mb-1'>Nhân viên đang chọn:</label>
-          <select id='empSelect' onchange='onSelectChange()' class='w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white mono'></select>
-        </div>
+    $('staffEmpty').hidden = staff.length > 0;
+    $('staffBody').innerHTML = staff.map(s => {
+      const pct = Math.max(0, Math.min(100, s.RemainingTtlSeconds / 15 * 100));
+      return `<tr data-id="${esc(s.EmpId)}" class="${s.EmpId === selectedId ? 'sel' : ''}">
+        <td class="id">${esc(s.EmpId)}</td>
+        <td>${esc(s.FullName)}<div class="sub">${esc(s.Department)} · ${esc(s.ClientIp)}</div></td>
+        <td>${badge(s)}</td>
+        <td><div class="ttl"><div class="bar"><i class="${s.RemainingTtlSeconds <= 6 ? 'low' : ''}" style="width:${pct}%"></i></div><span class="mono">${s.IsOnline ? s.RemainingTtlSeconds : 0}s</span></div></td>
+        <td class="mono">${rtt(s)}</td>
+        <td class="mono num">${s.UptimeSeconds}s</td>
+      </tr>`;
+    }).join('');
 
-        <div class='bg-slate-900/90 border border-slate-800 rounded-lg p-2.5 space-y-1 text-xs mono'>
-          <div class='flex justify-between'><span class='text-slate-400'>Redis Key:</span><span id='simKey' class='text-cyan-400'>staff:online:NV01</span></div>
-          <div class='flex justify-between'><span class='text-slate-400'>Nhịp tim &amp; RTT:</span><span id='simPings' class='text-emerald-400'>0 gói (1.0 ms)</span></div>
-          <div class='flex justify-between'><span class='text-slate-400'>Tin nhận cuối:</span><span id='simBroadcast' class='text-amber-300 truncate max-w-[180px]'>Chưa có</span></div>
-        </div>
+    const cur = staff.find(s => s.EmpId === selectedId);
+    $('simKey').textContent = cur ? `staff:online:${cur.EmpId}` : '-';
+    $('simPings').textContent = cur ? `${cur.PingCount} · ${rtt(cur)}` : '-';
+    $('simLast').textContent = cur && cur.LastBroadcast || '-';
+    const b = $('sockBadge');
+    b.textContent = !cur ? '-' : cur.IsRateLimited ? 'Bị khóa' : cur.IsSocketConnected ? 'Socket mở' : 'Socket đóng';
+    b.className = 'badge ' + (!cur ? 'off' : cur.IsRateLimited ? 'blocked' : cur.IsSocketConnected ? 'on' : 'off');
+  }
 
-        <div>
-          <label class='text-[11px] text-slate-400 block mb-1'>1. Đổi trạng thái (STATUS|Mã_NV|...):</label>
-          <div class='grid grid-cols-3 gap-2'>
-            <button onclick=""sendStatus('Online')"" class='py-1.5 rounded-lg text-xs font-semibold border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'>Online</button>
-            <button onclick=""sendStatus('Busy')"" class='py-1.5 rounded-lg text-xs font-semibold border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'>Busy</button>
-            <button onclick=""sendStatus('Away')"" class='py-1.5 rounded-lg text-xs font-semibold border border-sky-500/40 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'>Away</button>
-          </div>
-        </div>
+  $('staffBody').addEventListener('click', e => {
+    const tr = e.target.closest('tr[data-id]');
+    if (tr) { selectedId = tr.dataset.id; render(); }
+  });
 
-        <div class='pt-1.5 border-t border-slate-800 space-y-1.5'>
-          <label class='text-[11px] text-slate-400 block'>2. Báo cáo Tiến độ Task (Lưu vào Redis HASH):</label>
-          <div class='flex gap-1.5'>
-            <input id='taskInput' placeholder='VD: HRM-4 Thiết kế ERD (95%)' class='flex-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white'>
-            <button onclick='sendTaskUpdate()' class='px-3 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-xs font-semibold text-white'>Lưu Task</button>
-          </div>
-        </div>
+  function sendChat() {
+    const msg = $('chatMessage').value.trim();
+    if (!msg) return;
+    act('chat', { target: ($('chatTarget').value.trim() || 'ALL').toUpperCase(), message: msg });
+    $('chatMessage').value = '';
+  }
+  function sendBroadcast() {
+    const msg = $('broadcastInput').value.trim();
+    if (!msg) return;
+    apiAction({ action:'broadcast', message: msg });
+    $('broadcastInput').value = '';
+  }
+  function reconnect() {
+    const cur = staff.find(s => s.EmpId === selectedId);
+    if (cur) apiAction({ action:'connect', empId:cur.EmpId, fullName:cur.FullName, dept:cur.Department });
+  }
+  function addStaff() {
+    const id = $('newId').value.trim().toUpperCase();
+    if (!id) { $('newId').focus(); return; }
+    selectedId = id;
+    apiAction({ action:'connect', empId:id, fullName:$('newName').value.trim() || id, dept:$('newDept').value.trim() || 'IT' });
+    $('newId').value = $('newName').value = $('newDept').value = '';
+  }
+  $('chatMessage').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
+  $('broadcastInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendBroadcast(); });
 
-        <div class='pt-1.5 border-t border-slate-800 space-y-1.5'>
-          <label class='text-[11px] text-slate-400 block'>3. Gửi Chat / Nhắn riêng Unicast DM (Redis LIST):</label>
-          <div class='flex gap-1.5'>
-            <input id='chatTarget' placeholder='ALL hoặc NV02' class='w-24 bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs mono text-white'>
-            <input id='chatMessage' placeholder='Nội dung tin nhắn...' class='flex-1 bg-slate-900 border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white'>
-            <button onclick='sendChatMsg()' class='px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white'>Gửi</button>
-          </div>
-        </div>
-
-        <div class='pt-2 border-t border-slate-800 space-y-1.5'>
-          <label class='text-[11px] text-slate-400 block'>4. Kịch bản Kiểm thử Vấn đáp Môn Lập trình mạng:</label>
-          <button onclick='killSocket()' class='w-full py-2 px-3 rounded-lg text-xs font-semibold bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 text-left flex justify-between items-center'>
-            <span>A. Giả lập Sập nguồn / Rớt mạng (Đóng Socket)</span>
-            <span class='mono text-[10px] bg-rose-950 px-1.5 py-0.5 rounded'>Chờ TTL 15s</span>
-          </button>
-          <button onclick='triggerFlood()' class='w-full py-2 px-3 rounded-lg text-xs font-semibold bg-fuchsia-500/15 hover:bg-fuchsia-500/25 text-fuchsia-300 border border-fuchsia-500/30 text-left flex justify-between items-center'>
-            <span>B. Giả lập Tấn công Spam 30 gói (Rate-Limit)</span>
-            <span class='mono text-[10px] bg-fuchsia-950 px-1.5 py-0.5 rounded'>Khóa 30s</span>
-          </button>
-          <button onclick='logoutGraceful()' class='w-full py-2 px-3 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-left flex justify-between items-center'>
-            <span>C. Đăng xuất chuẩn (Gửi LOGOUT|Mã_NV)</span>
-            <span class='mono text-[10px] bg-slate-900 px-1.5 py-0.5 rounded'>Xóa Key ngay</span>
-          </button>
-          <button onclick='reconnectSelected()' class='w-full py-2 px-3 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white text-center'>
-            Kết nối lại TCP &amp; Mở khóa Nhân viên
-          </button>
-        </div>
-
-        <div class='pt-2 border-t border-slate-800 space-y-1.5'>
-          <label class='text-[11px] text-slate-400 block'>Thêm kết nối Nhân viên mới:</label>
-          <div class='grid grid-cols-3 gap-1.5'>
-            <input id='newId' placeholder='NV04' class='bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs mono text-white'>
-            <input id='newName' placeholder='Họ tên' class='bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white'>
-            <input id='newDept' placeholder='Phòng' class='bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white'>
-          </div>
-          <button onclick='addNewStaff()' class='w-full py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-500/30'>+ Mở kết nối TcpClient mới</button>
-        </div>
-      </div>
-    </aside>
-  </main>
-
-  <script>
-    let staffList = [];
-    let chatList = [];
-    let selectedEmpId = 'NV01';
-
-    async function apiAction(payload) {
-      await fetch('/api/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      await fetchState();
-    }
-
-    async function fetchState() {
-      try {
-        const res = await fetch('/api/state');
-        const data = await res.json();
-        document.getElementById('redisModeBadge').textContent = data.redisMode;
-        document.getElementById('lanIpBadge').textContent = data.lanIp;
-        staffList = data.staff || [];
-        chatList = data.chats || [];
-        renderDashboard();
-        renderLogs(data.logs || []);
-        renderChats();
-      } catch (e) {}
-    }
-
-    function renderDashboard() {
-      const total = staffList.length;
-      const online = staffList.filter(s => s.IsOnline).length;
-      const blocked = staffList.filter(s => s.IsRateLimited).length;
-      document.getElementById('kpiTotal').textContent = total;
-      document.getElementById('kpiOnline').textContent = online;
-      document.getElementById('kpiBlocked').textContent = blocked;
-      document.getElementById('kpiChats').textContent = chatList.length;
-
-      const select = document.getElementById('empSelect');
-      if (staffList.length > 0 && !staffList.some(s => s.EmpId === selectedEmpId)) {
-        selectedEmpId = staffList[0].EmpId;
-      }
-      select.innerHTML = staffList.map(s =>
-        `<option value='${s.EmpId}' ${s.EmpId === selectedEmpId ? 'selected' : ''}>${s.EmpId} — ${s.FullName} (${s.CurrentStatus})</option>`
-      ).join('');
-
-      const tbody = document.getElementById('staffBody');
-      tbody.innerHTML = staffList.map((s, idx) => {
-        const pct = Math.max(0, Math.min(100, (s.RemainingTtlSeconds / 15) * 100));
-        let badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-slate-800 text-slate-400'>OFFLINE</span>`;
-        if (s.IsRateLimited) {
-          badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-rose-500/20 text-rose-400 border border-rose-500/40 font-bold'>BLOCKED (${s.BlockedRemainingSeconds}s)</span>`;
-        } else if (s.IsOnline) {
-          if (s.CurrentStatus === 'Online') badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'>● Online</span>`;
-          else if (s.CurrentStatus === 'Busy') badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-amber-500/15 text-amber-400 border border-amber-500/30'>● Busy</span>`;
-          else badge = `<span class='px-2 py-0.5 rounded-full text-[11px] bg-sky-500/15 text-sky-400 border border-sky-500/30'>● Away</span>`;
-        }
-        const barColor = s.IsRateLimited ? 'bg-rose-600' : (!s.IsOnline ? 'bg-slate-700' : (s.RemainingTtlSeconds <= 6 ? 'bg-rose-500' : 'bg-emerald-500'));
-        const rowBg = s.EmpId === selectedEmpId ? 'bg-indigo-950/30' : 'hover:bg-slate-800/40';
-        const medal = idx === 0 ? '🥇 ' : (idx === 1 ? '🥈 ' : (idx === 2 ? '🥉 ' : ''));
-        return `<tr onclick=""selectRow('${s.EmpId}')"" class='cursor-pointer transition ${rowBg}'>
-          <td class='py-2.5 px-3 mono font-semibold text-cyan-400'>${medal}${s.EmpId}</td>
-          <td class='py-2.5 px-3'><div class='font-medium text-white'>${s.FullName}</div><div class='text-[11px] text-slate-400'>${s.Department} • ${s.ClientIp}</div></td>
-          <td class='py-2.5 px-3'>${badge}</td>
-          <td class='py-2.5 px-3'>
-            <div class='flex items-center gap-2'>
-              <div class='flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden'>
-                <div class='h-full ${barColor} transition-all duration-300' style='width:${pct}%'></div>
-              </div>
-              <span class='mono text-[11px] w-8 text-right ${s.RemainingTtlSeconds <= 6 && s.IsOnline ? ""text-rose-400 font-bold"" : ""text-slate-400""}'>${s.IsOnline ? s.RemainingTtlSeconds + 's' : '0s'}</span>
-            </div>
-          </td>
-          <td class='py-2.5 px-3 mono text-[11px] text-emerald-400'>${s.IsOnline ? s.RttMs + ' ms' : '-'}</td>
-          <td class='py-2.5 px-3 text-slate-200 max-w-[200px] truncate'>${s.CurrentTask}</td>
-          <td class='py-2.5 px-3 mono text-right font-semibold text-amber-300'>${s.UptimeSeconds}s</td>
-        </tr>`;
-      }).join('');
-
-      const cur = staffList.find(s => s.EmpId === selectedEmpId);
-      if (cur) {
-        document.getElementById('simKey').textContent = `staff:online:${cur.EmpId}`;
-        document.getElementById('simPings').textContent = `${cur.PingCount} gói (${cur.RttMs} ms)`;
-        document.getElementById('simBroadcast').textContent = cur.LastBroadcast || 'Chưa có';
-        const b = document.getElementById('simSocketBadge');
-        if (cur.IsRateLimited) {
-          b.textContent = 'SECOPS BLOCKED';
-          b.className = 'text-[11px] mono px-2 py-1 rounded bg-rose-500/20 text-rose-400 border border-rose-500/40';
-        } else if (cur.IsSocketConnected) {
-          b.textContent = 'SOCKET ACTIVE';
-          b.className = 'text-[11px] mono px-2 py-1 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30';
-        } else {
-          b.textContent = 'SOCKET CLOSED';
-          b.className = 'text-[11px] mono px-2 py-1 rounded bg-rose-500/10 text-rose-400 border border-rose-500/30';
-        }
-      }
-    }
-
-    function renderLogs(logs) {
-      const box = document.getElementById('logBox');
-      box.innerHTML = logs.map(l => {
-        let color = 'text-cyan-400';
-        if (l.Tag === 'PING') color = 'text-emerald-400';
-        else if (l.Tag === 'DROP' || l.Tag === 'ERROR' || l.Tag === 'SECOPS') color = 'text-rose-400';
-        else if (l.Tag === 'BROADCAST' || l.Tag === 'STATUS' || l.Tag === 'TASK') color = 'text-amber-400';
-        else if (l.Tag === 'UDP-9001' || l.Tag === 'DM' || l.Tag === 'CHAT') color = 'text-indigo-400';
-        return `<div class='flex gap-2'><span class='text-slate-500'>[${l.Time}]</span><span class='${color} font-semibold w-20'>[${l.Tag}]</span><span class='text-slate-300'>${l.Message}</span></div>`;
-      }).join('');
-    }
-
-    function renderChats() {
-      const box = document.getElementById('chatBox');
-      box.innerHTML = chatList.map(c =>
-        `<div class='flex gap-2 border-b border-slate-800/50 pb-1'><span class='text-slate-500'>[${c.Time}]</span><span class='text-cyan-400 font-semibold'>${c.Sender}→${c.Target}:</span><span class='text-slate-200'>${c.Content}</span></div>`
-      ).join('');
-    }
-
-    function selectRow(id) { selectedEmpId = id; renderDashboard(); }
-    function onSelectChange() { selectedEmpId = document.getElementById('empSelect').value; renderDashboard(); }
-    function sendStatus(st) { apiAction({ action: 'status', empId: selectedEmpId, status: st }); }
-    function sendTaskUpdate() {
-      const inp = document.getElementById('taskInput');
-      if (!inp.value.trim()) return;
-      apiAction({ action: 'task', empId: selectedEmpId, task: inp.value.trim() });
-      inp.value = '';
-    }
-    function sendChatMsg() {
-      const target = document.getElementById('chatTarget').value.trim() || 'ALL';
-      const msg = document.getElementById('chatMessage');
-      if (!msg.value.trim()) return;
-      apiAction({ action: 'chat', empId: selectedEmpId, target: target.toUpperCase(), message: msg.value.trim() });
-      msg.value = '';
-    }
-    function triggerFlood() { apiAction({ action: 'flood', empId: selectedEmpId }); }
-    function killSocket() { apiAction({ action: 'kill', empId: selectedEmpId }); }
-    function logoutGraceful() { apiAction({ action: 'logout', empId: selectedEmpId }); }
-    function reconnectSelected() {
-      const cur = staffList.find(s => s.EmpId === selectedEmpId);
-      if (cur) apiAction({ action: 'connect', empId: cur.EmpId, fullName: cur.FullName, dept: cur.Department, task: cur.CurrentTask });
-    }
-    function sendBroadcast() {
-      const inp = document.getElementById('broadcastInput');
-      if (!inp.value.trim()) return;
-      apiAction({ action: 'broadcast', message: inp.value.trim() });
-      inp.value = '';
-    }
-    function addNewStaff() {
-      const id = document.getElementById('newId').value.trim() || 'NV04';
-      const name = document.getElementById('newName').value.trim() || 'Nhân viên Mới';
-      const dept = document.getElementById('newDept').value.trim() || 'IT';
-      selectedEmpId = id.toUpperCase();
-      apiAction({ action: 'connect', empId: id, fullName: name, dept: dept, task: 'HRM-5: Tích hợp Socket mới' });
-    }
-    function clearLogs() { apiAction({ action: 'clear_logs' }); }
-
-    setInterval(fetchState, 1000);
-    fetchState();
-  </script>
+  setInterval(refresh, 1000);
+  refresh();
+</script>
 </body>
-</html>";
+</html>
+""";
     }
 }

@@ -13,9 +13,8 @@ namespace iec
         public string CurrentStatus { get; set; }
         public double RemainingTtlSeconds { get; set; }
         public int PingCount { get; set; }
-        public double RttMs { get; set; }
+        public double? RttMs { get; set; }             // null = chưa đo được
         public double UptimeSeconds { get; set; }
-        public string CurrentTask { get; set; }
         public string LastBroadcast { get; set; }
         public bool IsSocketConnected { get; set; }
         public bool IsRateLimited { get; set; }
@@ -44,8 +43,9 @@ namespace iec
         public const int WebUiPort = 5050;            // Cổng giao diện Web Cockpit
         public const int HeartbeatIntervalMs = 5000;  // Chu kỳ nhịp tim 5 giây
         public const int OnlineTtlSeconds = 15;       // Khóa Redis tự hủy sau 15 giây
+        public const int MaxLineLength = 4096;        // Giới hạn độ dài 1 dòng lệnh TCP
 
-        // Cấu hình Redis Sliding/Fixed-Window Rate Limiter chống Spam gói tin TCP
+        // Cấu hình Redis Fixed-Window Rate Limiter chống Spam gói tin TCP
         public const int MaxPacketsPerWindow = 25;    // Tối đa 25 gói tin / 10 giây
         public const int RateWindowSeconds = 10;
         public const int BlockDurationSeconds = 30;   // Khóa 30 giây nếu vi phạm
@@ -53,12 +53,14 @@ namespace iec
         public const string CmdLogin = "LOGIN";
         public const string CmdPing = "PING";
         public const string CmdStatus = "STATUS";
-        public const string CmdTask = "TASK";
         public const string CmdChat = "CHAT";
         public const string CmdDm = "DM";
         public const string CmdLogout = "LOGOUT";
         public const string UdpDiscoverRequest = "DISCOVER_IEC_SERVER";
         public const string UdpDiscoverResponse = "IEC_SERVER_HERE";
+
+        // Mỗi Server IEC có Web Cockpit riêng: TCP 9000 -> Web 5050, TCP 9100 -> Web 5150
+        public static int WebPortFor(int tcpPort) => WebUiPort + tcpPort - DefaultPort;
 
         public static string Sanitize(string input, string fallback = "N/A")
         {
